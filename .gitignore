@@ -1,0 +1,17 @@
+# Private planning + agent instructions (kept local)
+AGENTS.md
+plan/
+
+# Go build output
+bin/
+*.test
+*.out
+vendor/
+
+# Local daemon state
+.aig/
+
+# IDE / OS noise
+.DS_Store
+.idea/
+.vscode/
