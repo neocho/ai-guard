@@ -13,6 +13,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(cmdRun(os.Args[2:]))
+	case "serve":
+		os.Exit(cmdServe(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		os.Exit(0)
@@ -28,6 +30,7 @@ func usage(w *os.File) {
 
 commands:
   run <cmd> [args...]    spawn cmd with HTTPS_PROXY pointed at an in-process proxy
+  serve [--addr H:P]     serve a local JSON API on top of the captures store
 
 flags:
   -h, --help             show this help`)

@@ -146,7 +146,7 @@ func TestMITM_DecryptsAndForwards(t *testing.T) {
 	if err := s.Flush(flushCtx); err != nil {
 		t.Fatalf("store flush: %v", err)
 	}
-	captures, err := s.List(context.Background(), 10)
+	captures, err := s.List(context.Background(), 0, 10)
 	if err != nil {
 		t.Fatalf("store list: %v", err)
 	}

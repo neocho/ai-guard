@@ -18,8 +18,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Capture is one intercepted request/response pair.
+// Capture is one intercepted request/response pair. ID is populated by
+// queries; Append leaves it at zero.
 type Capture struct {
+	ID          int64
 	SessionID   string
 	PID         int
 	Timestamp   time.Time
@@ -128,11 +130,16 @@ func (s *Store) Dropped() int64 {
 	return s.dropped.Load()
 }
 
-// List returns up to limit captures, newest-first by timestamp. Intended
-// for the UI feed (T-006) and tests; production query patterns should
-// expand this with filters/pagination.
-func (s *Store) List(ctx context.Context, limit int) ([]*Capture, error) {
-	rows, err := s.db.QueryContext(ctx, listSQL, limit)
+// List returns up to limit captures, newest-first by id. If beforeID > 0,
+// only rows with id < beforeID are returned (cursor pagination).
+func (s *Store) List(ctx context.Context, beforeID int64, limit int) ([]*Capture, error) {
+	var rows *sql.Rows
+	var err error
+	if beforeID > 0 {
+		rows, err = s.db.QueryContext(ctx, listBeforeSQL, beforeID, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, listSQL, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -140,22 +147,93 @@ func (s *Store) List(ctx context.Context, limit int) ([]*Capture, error) {
 
 	var out []*Capture
 	for rows.Next() {
-		c := &Capture{}
-		var ts int64
-		var truncated int
-		if err := rows.Scan(
-			&c.SessionID, &c.PID, &ts, &c.Host,
-			&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
-			&c.RespStatus, &c.RespHeaders, &c.RespBody,
-			&c.DurationMS, &c.ALPN, &truncated,
-		); err != nil {
+		c, err := scanCapture(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.Timestamp = time.Unix(0, ts)
-		c.Truncated = truncated != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// ListSince returns up to limit captures with id > sinceID, in ascending
+// id order. Used by the SSE stream endpoint to push new captures in the
+// order they were recorded.
+func (s *Store) ListSince(ctx context.Context, sinceID int64, limit int) ([]*Capture, error) {
+	rows, err := s.db.QueryContext(ctx, listSinceSQL, sinceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Capture
+	for rows.Next() {
+		c, err := scanCapture(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Get fetches a single capture by id. Returns sql.ErrNoRows if not found.
+func (s *Store) Get(ctx context.Context, id int64) (*Capture, error) {
+	row := s.db.QueryRowContext(ctx, getSQL, id)
+	c, err := scanCaptureRow(row)
+	if err != nil {
+		return nil, err
+	}
+	c.ID = id
+	return c, nil
+}
+
+// LastID returns the max id in the captures table, or 0 if empty.
+func (s *Store) LastID(ctx context.Context) (int64, error) {
+	var id sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(id) FROM captures").Scan(&id); err != nil {
+		return 0, err
+	}
+	return id.Int64, nil
+}
+
+// scannable is the minimal interface satisfied by both *sql.Row and *sql.Rows.
+type scannable interface {
+	Scan(dest ...any) error
+}
+
+func scanCapture(rows *sql.Rows) (*Capture, error) {
+	c := &Capture{}
+	var ts int64
+	var truncated int
+	if err := rows.Scan(
+		&c.ID, &c.SessionID, &c.PID, &ts, &c.Host,
+		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
+		&c.RespStatus, &c.RespHeaders, &c.RespBody,
+		&c.DurationMS, &c.ALPN, &truncated,
+	); err != nil {
+		return nil, err
+	}
+	c.Timestamp = time.Unix(0, ts)
+	c.Truncated = truncated != 0
+	return c, nil
+}
+
+func scanCaptureRow(row *sql.Row) (*Capture, error) {
+	c := &Capture{}
+	var ts int64
+	var truncated int
+	if err := row.Scan(
+		&c.SessionID, &c.PID, &ts, &c.Host,
+		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
+		&c.RespStatus, &c.RespHeaders, &c.RespBody,
+		&c.DurationMS, &c.ALPN, &truncated,
+	); err != nil {
+		return nil, err
+	}
+	c.Timestamp = time.Unix(0, ts)
+	c.Truncated = truncated != 0
+	return c, nil
 }
 
 // Flush blocks until the buffered writes drain to disk. Useful in tests
@@ -248,11 +326,42 @@ INSERT INTO captures (
 `
 
 const listSQL = `
+SELECT id, session_id, pid, ts, host,
+       method, path, req_headers, req_body,
+       resp_status, resp_headers, resp_body,
+       duration_ms, alpn, truncated
+FROM captures
+ORDER BY id DESC
+LIMIT ?
+`
+
+const listBeforeSQL = `
+SELECT id, session_id, pid, ts, host,
+       method, path, req_headers, req_body,
+       resp_status, resp_headers, resp_body,
+       duration_ms, alpn, truncated
+FROM captures
+WHERE id < ?
+ORDER BY id DESC
+LIMIT ?
+`
+
+const listSinceSQL = `
+SELECT id, session_id, pid, ts, host,
+       method, path, req_headers, req_body,
+       resp_status, resp_headers, resp_body,
+       duration_ms, alpn, truncated
+FROM captures
+WHERE id > ?
+ORDER BY id ASC
+LIMIT ?
+`
+
+const getSQL = `
 SELECT session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
        duration_ms, alpn, truncated
 FROM captures
-ORDER BY ts DESC
-LIMIT ?
+WHERE id = ?
 `
