@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
 
+	"github.com/neocho/ai-guard/internal/ca"
 	"github.com/neocho/ai-guard/internal/paths"
 	"github.com/neocho/ai-guard/internal/proxy"
 	"github.com/neocho/ai-guard/internal/runner"
@@ -39,6 +43,37 @@ func cmdRun(args []string) int {
 
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	caCertPath, err := paths.CAFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: %v\n", err)
+		return 1
+	}
+	caKeyPath, err := paths.CAKeyFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: %v\n", err)
+		return 1
+	}
+
+	firstRun := false
+	if _, err := os.Stat(caCertPath); errors.Is(err, fs.ErrNotExist) {
+		firstRun = true
+	}
+
+	caInst, err := ca.LoadOrGenerate(caCertPath, caKeyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: load CA: %v\n", err)
+		return 1
+	}
+
+	if firstRun {
+		fp := sha256.Sum256(caInst.Cert.Raw)
+		fmt.Fprintf(os.Stderr, "aig: generated local CA at %s\n", caCertPath)
+		fmt.Fprintf(os.Stderr, "aig: fingerprint sha256:%s\n", hex.EncodeToString(fp[:]))
+		fmt.Fprintf(os.Stderr, "aig: this CA is trusted only by processes you wrap with `aig run`\n")
+	}
+
+	minter := ca.NewMinter(caInst)
+
 	sessionID, err := newSessionID()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aig: session id generation failed: %v\n", err)
@@ -62,11 +97,13 @@ func cmdRun(args []string) int {
 		"session_id", sessionID,
 		"proxy", proxyAddr,
 		"cmd", args[0],
+		"mitm", true,
 	)
 
 	p := proxy.New(proxy.Options{
 		SessionID: sessionID,
 		Logger:    logger,
+		Mint:      minter.CertFor,
 	})
 
 	go func() {
@@ -83,6 +120,10 @@ func cmdRun(args []string) int {
 		"HTTP_PROXY="+proxyURL,
 		"https_proxy="+proxyURL,
 		"http_proxy="+proxyURL,
+		"NODE_EXTRA_CA_CERTS="+caCertPath,
+		"SSL_CERT_FILE="+caCertPath,
+		"REQUESTS_CA_BUNDLE="+caCertPath,
+		"CURL_CA_BUNDLE="+caCertPath,
 	)
 
 	code, err := runner.Run(ctx, args, env)

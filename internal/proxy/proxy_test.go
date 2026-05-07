@@ -2,27 +2,34 @@ package proxy_test
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/neocho/ai-guard/internal/ca"
 	"github.com/neocho/ai-guard/internal/proxy"
 )
 
-// TestTunnelsCONNECT verifies the proxy:
+// TestPassthrough_TunnelsCONNECT verifies the no-MITM path:
 //   - accepts a CONNECT request,
 //   - replies "HTTP/1.1 200 Connection established",
-//   - bridges bytes bidirectionally between client and upstream.
+//   - bridges raw bytes bidirectionally between client and upstream.
 //
-// We stand up a fake upstream that echoes whatever it receives, so writing
-// "hello" through the tunnel should yield "hello" back.
-func TestTunnelsCONNECT(t *testing.T) {
+// This exercises the same path as before T-004 — when Options.Mint is nil
+// the proxy tunnels without touching bytes.
+func TestPassthrough_TunnelsCONNECT(t *testing.T) {
 	upstreamAddr := startEchoServer(t)
-	proxyAddr := startProxy(t)
+	proxyAddr := startProxy(t, proxy.Options{}) // Mint nil → passthrough
 
 	client, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
@@ -31,7 +38,6 @@ func TestTunnelsCONNECT(t *testing.T) {
 	defer client.Close()
 	client.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// Send a CONNECT request asking for a tunnel to the echo server.
 	if _, err := fmt.Fprintf(client,
 		"CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",
 		upstreamAddr, upstreamAddr,
@@ -40,27 +46,10 @@ func TestTunnelsCONNECT(t *testing.T) {
 	}
 
 	br := bufio.NewReader(client)
-
-	// Read the status line and confirm 200.
-	statusLine, err := br.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read status line: %v", err)
-	}
-	if !strings.Contains(statusLine, "200") {
-		t.Fatalf("expected 200 in status line, got %q", strings.TrimSpace(statusLine))
-	}
-	// Drain headers until the blank line that ends them.
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read header line: %v", err)
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
+	if !readStatus200(t, br) {
+		return
 	}
 
-	// Tunnel is open. Send a payload, expect it echoed back unchanged.
 	want := []byte("hello tunnel")
 	if _, err := client.Write(want); err != nil {
 		t.Fatalf("write payload: %v", err)
@@ -74,8 +63,98 @@ func TestTunnelsCONNECT(t *testing.T) {
 	}
 }
 
-// startEchoServer returns a fake upstream that echoes whatever it receives.
-// Registered with t.Cleanup so the listener closes at test end.
+// TestMITM_DecryptsAndForwards verifies the MITM path end-to-end:
+//   - Real TLS upstream (httptest.NewTLSServer) returning a known body
+//   - Our proxy in MITM mode with a freshly generated CA + minter
+//   - HTTP client trusting our CA, configured to use our proxy
+//
+// The client's GET is encrypted with session keys derived from our minted
+// cert; our proxy decrypts, opens a separate TLS connection to upstream,
+// re-encrypts, gets the response, and reverses the process. If anything
+// in the TLS termination, ALPN mirroring, or bridging is broken, the
+// response body won't match.
+func TestMITM_DecryptsAndForwards(t *testing.T) {
+	const wantBody = "hello from upstream"
+
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, wantBody)
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+
+	// Build a pool that trusts the upstream's self-signed cert so the
+	// proxy's upstream-side TLS client can verify it.
+	upstreamPool := x509.NewCertPool()
+	upstreamPool.AddCert(upstream.Certificate())
+
+	caInst := newCA(t)
+	minter := ca.NewMinter(caInst)
+
+	proxyAddr := startProxy(t, proxy.Options{
+		Mint:              minter.CertFor,
+		UpstreamTLSConfig: &tls.Config{RootCAs: upstreamPool},
+	})
+
+	// Client trusts our CA — so it will accept the leaf certs we mint.
+	clientPool := x509.NewCertPool()
+	clientPool.AddCert(caInst.Cert)
+
+	proxyURL, _ := url.Parse("http://" + proxyAddr)
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    clientPool,
+				NextProtos: []string{"h2", "http/1.1"},
+			},
+			ForceAttemptHTTP2: true,
+		},
+	}
+
+	resp, err := httpClient.Get(upstream.URL)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), wantBody) {
+		t.Fatalf("body = %q, want it to contain %q", body, wantBody)
+	}
+}
+
+// readStatus200 reads the HTTP status line + headers off br, returning
+// true if the status is 200. On failure it calls t.Fatal.
+func readStatus200(t *testing.T, br *bufio.Reader) bool {
+	t.Helper()
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+		return false
+	}
+	if !strings.Contains(statusLine, "200") {
+		t.Fatalf("expected 200 status, got %q", strings.TrimSpace(statusLine))
+		return false
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read header line: %v", err)
+			return false
+		}
+		if line == "\r\n" || line == "\n" {
+			return true
+		}
+	}
+}
+
 func startEchoServer(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -99,19 +178,21 @@ func startEchoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// startProxy starts our proxy on a random port with logs discarded.
-// Registered with t.Cleanup so the proxy shuts down at test end.
-func startProxy(t *testing.T) string {
+func startProxy(t *testing.T, opts proxy.Options) string {
 	t.Helper()
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if opts.SessionID == "" {
+		opts.SessionID = "test"
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
 
-	p := proxy.New(proxy.Options{
-		SessionID: "test",
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	p := proxy.New(opts)
 	go func() { _ = p.Serve(ln) }()
 
 	t.Cleanup(func() {
@@ -119,4 +200,14 @@ func startProxy(t *testing.T) string {
 		_ = ln.Close()
 	})
 	return ln.Addr().String()
+}
+
+func newCA(t *testing.T) *ca.CA {
+	t.Helper()
+	dir := t.TempDir()
+	c, err := ca.LoadOrGenerate(filepath.Join(dir, "ca.pem"), filepath.Join(dir, "ca-key.pem"))
+	if err != nil {
+		t.Fatalf("ca: %v", err)
+	}
+	return c
 }
