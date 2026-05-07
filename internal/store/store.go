@@ -1,0 +1,258 @@
+// Package store persists intercepted HTTP requests + responses to a local
+// SQLite database. Writes are async — the proxy hot path pushes Captures
+// onto a buffered channel and a background goroutine drains them. The
+// channel drops on overflow so traffic keeps flowing even if disk I/O
+// stalls; dropped captures are logged via the supplied logger.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// Capture is one intercepted request/response pair.
+type Capture struct {
+	SessionID   string
+	PID         int
+	Timestamp   time.Time
+	Host        string // e.g. "api.anthropic.com:443"
+	Method      string
+	Path        string
+	ReqHeaders  string // JSON-encoded http.Header
+	ReqBody     []byte
+	RespStatus  int
+	RespHeaders string
+	RespBody    []byte
+	DurationMS  int64
+	ALPN        string // "h2", "http/1.1", or ""
+	Truncated   bool   // true if either body was capped at MaxBodyBytes
+}
+
+// MaxBodyBytes caps inline body storage. Bodies larger than this are
+// truncated and Capture.Truncated is set to true.
+const MaxBodyBytes = 1 << 20 // 1 MiB
+
+// Store is an append-only persistent log of Captures.
+type Store struct {
+	db     *sql.DB
+	logger *slog.Logger
+
+	ch     chan *Capture
+	wg     sync.WaitGroup
+	closed atomic.Bool
+
+	dropped atomic.Int64
+}
+
+// Options configures Open.
+type Options struct {
+	// Logger receives drop/error events. Defaults to slog.Default().
+	Logger *slog.Logger
+	// BufferSize is the channel depth for pending writes. Defaults to 256.
+	BufferSize int
+}
+
+// Open opens (or creates) the SQLite database at path, applies the schema,
+// and starts the background drain goroutine. Call Close to flush + close.
+func Open(path string, opts Options) (*Store, error) {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.BufferSize <= 0 {
+		opts.BufferSize = 256
+	}
+
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite: %w", err)
+	}
+
+	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	s := &Store{
+		db:     db,
+		logger: opts.Logger,
+		ch:     make(chan *Capture, opts.BufferSize),
+	}
+	s.wg.Add(1)
+	go s.drain()
+	return s, nil
+}
+
+// Append enqueues c for asynchronous persistence. Non-blocking: if the
+// internal buffer is full, the capture is dropped and a warn is logged.
+// Append is safe to call from any goroutine. After Close, Append is a
+// no-op.
+func (s *Store) Append(c *Capture) {
+	if s.closed.Load() {
+		return
+	}
+	c = truncate(c)
+	select {
+	case s.ch <- c:
+	default:
+		n := s.dropped.Add(1)
+		s.logger.Warn("capture dropped (store buffer full)",
+			"total_dropped", n, "session_id", c.SessionID)
+	}
+}
+
+// Close flushes pending writes and closes the underlying database. Subsequent
+// Append calls become no-ops.
+func (s *Store) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.ch)
+	s.wg.Wait()
+	return s.db.Close()
+}
+
+// Dropped returns the number of captures dropped due to buffer overflow.
+func (s *Store) Dropped() int64 {
+	return s.dropped.Load()
+}
+
+// List returns up to limit captures, newest-first by timestamp. Intended
+// for the UI feed (T-006) and tests; production query patterns should
+// expand this with filters/pagination.
+func (s *Store) List(ctx context.Context, limit int) ([]*Capture, error) {
+	rows, err := s.db.QueryContext(ctx, listSQL, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Capture
+	for rows.Next() {
+		c := &Capture{}
+		var ts int64
+		var truncated int
+		if err := rows.Scan(
+			&c.SessionID, &c.PID, &ts, &c.Host,
+			&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
+			&c.RespStatus, &c.RespHeaders, &c.RespBody,
+			&c.DurationMS, &c.ALPN, &truncated,
+		); err != nil {
+			return nil, err
+		}
+		c.Timestamp = time.Unix(0, ts)
+		c.Truncated = truncated != 0
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Flush blocks until the buffered writes drain to disk. Useful in tests
+// after Append-ing rows to ensure they're visible. Production callers
+// generally don't need it — Close drains too.
+func (s *Store) Flush(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if len(s.ch) == 0 {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (s *Store) drain() {
+	defer s.wg.Done()
+	for c := range s.ch {
+		if err := s.write(c); err != nil {
+			s.logger.Error("capture write failed",
+				"err", err, "session_id", c.SessionID, "host", c.Host)
+		}
+	}
+}
+
+func (s *Store) write(c *Capture) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, insertSQL,
+		c.SessionID, c.PID, c.Timestamp.UnixNano(), c.Host,
+		c.Method, c.Path, c.ReqHeaders, c.ReqBody,
+		c.RespStatus, c.RespHeaders, c.RespBody,
+		c.DurationMS, c.ALPN, c.Truncated,
+	)
+	if err != nil {
+		return fmt.Errorf("insert: %w", err)
+	}
+	return nil
+}
+
+func truncate(c *Capture) *Capture {
+	if len(c.ReqBody) > MaxBodyBytes {
+		c.ReqBody = c.ReqBody[:MaxBodyBytes]
+		c.Truncated = true
+	}
+	if len(c.RespBody) > MaxBodyBytes {
+		c.RespBody = c.RespBody[:MaxBodyBytes]
+		c.Truncated = true
+	}
+	return c
+}
+
+// ErrClosed is returned from query helpers when the store is closed.
+var ErrClosed = errors.New("store: closed")
+
+const schema = `
+CREATE TABLE IF NOT EXISTS captures (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    pid           INTEGER NOT NULL,
+    ts            INTEGER NOT NULL,
+    host          TEXT NOT NULL,
+    method        TEXT,
+    path          TEXT,
+    req_headers   TEXT,
+    req_body      BLOB,
+    resp_status   INTEGER,
+    resp_headers  TEXT,
+    resp_body     BLOB,
+    duration_ms   INTEGER,
+    alpn          TEXT,
+    truncated     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_captures_ts ON captures(ts);
+CREATE INDEX IF NOT EXISTS idx_captures_session ON captures(session_id);
+`
+
+const insertSQL = `
+INSERT INTO captures (
+    session_id, pid, ts, host,
+    method, path, req_headers, req_body,
+    resp_status, resp_headers, resp_body,
+    duration_ms, alpn, truncated
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+const listSQL = `
+SELECT session_id, pid, ts, host,
+       method, path, req_headers, req_body,
+       resp_status, resp_headers, resp_body,
+       duration_ms, alpn, truncated
+FROM captures
+ORDER BY ts DESC
+LIMIT ?
+`

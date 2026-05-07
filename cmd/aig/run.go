@@ -16,6 +16,7 @@ import (
 	"github.com/neocho/ai-guard/internal/paths"
 	"github.com/neocho/ai-guard/internal/proxy"
 	"github.com/neocho/ai-guard/internal/runner"
+	"github.com/neocho/ai-guard/internal/store"
 )
 
 func cmdRun(args []string) int {
@@ -74,6 +75,18 @@ func cmdRun(args []string) int {
 
 	minter := ca.NewMinter(caInst)
 
+	dbPath, err := paths.CapturesDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: %v\n", err)
+		return 1
+	}
+	captures, err := store.Open(dbPath, store.Options{Logger: logger})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: open captures store: %v\n", err)
+		return 1
+	}
+	defer captures.Close()
+
 	sessionID, err := newSessionID()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aig: session id generation failed: %v\n", err)
@@ -104,6 +117,7 @@ func cmdRun(args []string) int {
 		SessionID: sessionID,
 		Logger:    logger,
 		Mint:      minter.CertFor,
+		Store:     captures,
 	})
 
 	go func() {

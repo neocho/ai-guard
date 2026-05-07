@@ -2,6 +2,8 @@ package proxy_test
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -13,11 +15,13 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/neocho/ai-guard/internal/ca"
 	"github.com/neocho/ai-guard/internal/proxy"
+	"github.com/neocho/ai-guard/internal/store"
 )
 
 // TestPassthrough_TunnelsCONNECT verifies the no-MITM path:
@@ -64,15 +68,15 @@ func TestPassthrough_TunnelsCONNECT(t *testing.T) {
 }
 
 // TestMITM_DecryptsAndForwards verifies the MITM path end-to-end:
-//   - Real TLS upstream (httptest.NewTLSServer) returning a known body
-//   - Our proxy in MITM mode with a freshly generated CA + minter
-//   - HTTP client trusting our CA, configured to use our proxy
+//   - Real TLS upstream (httptest h2 server) returning a known body.
+//   - Our proxy in MITM mode with a freshly generated CA + minter.
+//   - A capture Store wired in.
+//   - HTTP client trusting our CA, configured to use our proxy.
 //
-// The client's GET is encrypted with session keys derived from our minted
-// cert; our proxy decrypts, opens a separate TLS connection to upstream,
-// re-encrypts, gets the response, and reverses the process. If anything
-// in the TLS termination, ALPN mirroring, or bridging is broken, the
-// response body won't match.
+// On success the client receives the upstream body unchanged, and one
+// row lands in the store with method/host/path matching the request.
+// Any breakage in TLS termination, h2 dispatch, ALPN mirroring, or
+// upstream RoundTrip will fail one of these checks.
 func TestMITM_DecryptsAndForwards(t *testing.T) {
 	const wantBody = "hello from upstream"
 
@@ -83,20 +87,27 @@ func TestMITM_DecryptsAndForwards(t *testing.T) {
 	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
 
-	// Build a pool that trusts the upstream's self-signed cert so the
-	// proxy's upstream-side TLS client can verify it.
 	upstreamPool := x509.NewCertPool()
 	upstreamPool.AddCert(upstream.Certificate())
 
 	caInst := newCA(t)
 	minter := ca.NewMinter(caInst)
 
+	storeDir := t.TempDir()
+	s, err := store.Open(filepath.Join(storeDir, "captures.db"), store.Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
 	proxyAddr := startProxy(t, proxy.Options{
 		Mint:              minter.CertFor,
 		UpstreamTLSConfig: &tls.Config{RootCAs: upstreamPool},
+		Store:             s,
 	})
 
-	// Client trusts our CA — so it will accept the leaf certs we mint.
 	clientPool := x509.NewCertPool()
 	clientPool.AddCert(caInst.Cert)
 
@@ -113,7 +124,7 @@ func TestMITM_DecryptsAndForwards(t *testing.T) {
 		},
 	}
 
-	resp, err := httpClient.Get(upstream.URL)
+	resp, err := httpClient.Get(upstream.URL + "/some/path")
 	if err != nil {
 		t.Fatalf("client.Get: %v", err)
 	}
@@ -127,6 +138,33 @@ func TestMITM_DecryptsAndForwards(t *testing.T) {
 	}
 	if !strings.Contains(string(body), wantBody) {
 		t.Fatalf("body = %q, want it to contain %q", body, wantBody)
+	}
+
+	// Wait for the async store write to flush, then assert the capture.
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Flush(flushCtx); err != nil {
+		t.Fatalf("store flush: %v", err)
+	}
+	captures, err := s.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("store list: %v", err)
+	}
+	if len(captures) == 0 {
+		t.Fatalf("expected at least one capture, got 0")
+	}
+	c := captures[0]
+	if c.Method != "GET" {
+		t.Errorf("capture method = %q, want GET", c.Method)
+	}
+	if c.Path != "/some/path" {
+		t.Errorf("capture path = %q, want /some/path", c.Path)
+	}
+	if !strings.Contains(string(c.RespBody), wantBody) {
+		t.Errorf("capture resp body = %q, want it to contain %q", c.RespBody, wantBody)
+	}
+	if c.RespStatus != 200 {
+		t.Errorf("capture resp_status = %d, want 200", c.RespStatus)
 	}
 }
 
@@ -178,10 +216,35 @@ func startEchoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+// captureBuf collects log output into a buffer that's safe to write to from
+// any goroutine (including ones still running after a test finishes). The
+// buffer is dumped to t.Log on test failure for debugging.
+type captureBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *captureBuf) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+func (c *captureBuf) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
 func startProxy(t *testing.T, opts proxy.Options) string {
 	t.Helper()
 	if opts.Logger == nil {
-		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		cap := &captureBuf{}
+		opts.Logger = slog.New(slog.NewTextHandler(cap, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Logf("proxy logs:\n%s", cap.String())
+			}
+		})
 	}
 	if opts.SessionID == "" {
 		opts.SessionID = "test"

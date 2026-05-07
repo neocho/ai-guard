@@ -58,3 +58,13 @@ func CAKeyFile() (string, error) {
 	}
 	return filepath.Join(d, "ca-key.pem"), nil
 }
+
+// CapturesDB returns the absolute path to ~/.aig/captures.db, the SQLite
+// store where intercepted requests are persisted.
+func CapturesDB() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "captures.db"), nil
+}
