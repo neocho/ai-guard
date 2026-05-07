@@ -13,6 +13,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -303,7 +305,30 @@ func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connec
 			"err", err, "session_id", p.opts.SessionID)
 	}
 
-	p.appendCapture(reqStart, connectHost, r, reqBody, resp.StatusCode, resp.Header, capBuf.Bytes())
+	respBody := decompressIfNeeded(capBuf.Bytes(), resp.Header)
+	p.appendCapture(reqStart, connectHost, r, reqBody, resp.StatusCode, resp.Header, respBody)
+}
+
+// decompressIfNeeded returns the logical (decompressed) body for capture
+// when Content-Encoding is gzip. We always re-emit the original encoded
+// bytes to the client; this only affects what we store. Other encodings
+// (br, deflate, zstd) are left as-is for now — gzip covers ~95% of API
+// responses and adding the others is mechanical when needed.
+func decompressIfNeeded(body []byte, headers http.Header) []byte {
+	enc := strings.ToLower(strings.TrimSpace(headers.Get("Content-Encoding")))
+	if enc != "gzip" || len(body) == 0 {
+		return body
+	}
+	r, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return body
+	}
+	defer r.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, reqBody []byte, status int, respHeaders http.Header, respBody []byte) {
