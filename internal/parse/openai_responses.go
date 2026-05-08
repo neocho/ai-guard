@@ -237,16 +237,21 @@ func stringOrJSONString(raw json.RawMessage) string {
 func parseOAIResponsesTools(in []oaiResponsesTool) []ToolDef {
 	out := make([]ToolDef, 0, len(in))
 	for _, t := range in {
-		// Only function tools have parsable schema; built-in tools
-		// (web_search, computer_use, etc.) are surfaced by name only.
+		// Built-in tools (web_search, computer_use, etc.) lack a `name`
+		// field in OpenAI's wire format — only `type`. Fall back to type
+		// so callers always have a non-empty display name.
+		name := t.Name
+		if name == "" {
+			name = t.Type
+		}
 		desc := t.Description
 		if t.Type != "" && t.Type != "function" {
 			if desc == "" {
-				desc = "(builtin: " + t.Type + ")"
+				desc = "(builtin)"
 			}
 		}
 		out = append(out, ToolDef{
-			Name:        t.Name,
+			Name:        name,
 			Description: desc,
 			InputSchema: t.Parameters,
 		})

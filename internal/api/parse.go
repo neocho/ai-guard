@@ -1,10 +1,61 @@
 package api
 
 import (
+	"encoding/json"
 	"net"
 
 	"github.com/neocho/ai-guard/internal/parse"
 )
+
+// normalizeRequest replaces nil slices with empty ones so JSON encoding
+// emits `[]` instead of `null`. Strict-typed clients (Swift Codable,
+// strongly-typed TypeScript, etc.) reject `null` for non-optional array
+// fields; emitting empty arrays sidesteps that whole class of bug.
+func normalizeRequest(r *parse.Request) {
+	if r == nil {
+		return
+	}
+	if r.Messages == nil {
+		r.Messages = []parse.Message{}
+	}
+	if r.Tools == nil {
+		r.Tools = []parse.ToolDef{}
+	}
+	for i := range r.Messages {
+		if r.Messages[i].Content == nil {
+			r.Messages[i].Content = []parse.Block{}
+		}
+		for j := range r.Messages[i].Content {
+			normalizeBlock(&r.Messages[i].Content[j])
+		}
+	}
+	for i := range r.Tools {
+		if r.Tools[i].InputSchema == nil {
+			r.Tools[i].InputSchema = json.RawMessage("null")
+		}
+	}
+}
+
+func normalizeResponse(r *parse.Response) {
+	if r == nil {
+		return
+	}
+	if r.Content == nil {
+		r.Content = []parse.Block{}
+	}
+	for i := range r.Content {
+		normalizeBlock(&r.Content[i])
+	}
+}
+
+func normalizeBlock(b *parse.Block) {
+	if b == nil {
+		return
+	}
+	if b.ToolUse != nil && b.ToolUse.Input == nil {
+		b.ToolUse.Input = json.RawMessage("null")
+	}
+}
 
 // dispatchParse calls the right provider parser based on host + path. When
 // the capture isn't from a recognized API, both returns are nil and we fall

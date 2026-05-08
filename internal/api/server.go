@@ -158,6 +158,8 @@ func (s *Server) handleGetCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	parsedReq, parsedResp := dispatchParse(c.Host, c.Path, c.ReqBody, c.RespBody)
+	normalizeRequest(parsedReq)
+	normalizeResponse(parsedResp)
 
 	d := detailResponse{
 		listItem:    captureToListItem(c),

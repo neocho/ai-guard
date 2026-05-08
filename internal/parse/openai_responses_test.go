@@ -1,7 +1,6 @@
 package parse_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/neocho/ai-guard/internal/parse"
@@ -114,11 +113,14 @@ func TestOpenAIResponsesRequest_Tools(t *testing.T) {
 	if req.Tools[0].Name != "Bash" {
 		t.Errorf("first tool name = %q", req.Tools[0].Name)
 	}
-	if req.Tools[1].Description == "" {
-		t.Errorf("builtin web_search should get a synthetic description")
+	// Builtin tools without a `name` field fall back to using `type`
+	// as the display name (e.g. web_search → "web_search"), so callers
+	// always have a non-empty label.
+	if req.Tools[1].Name != "web_search" {
+		t.Errorf("builtin should fall back to type as name, got %q", req.Tools[1].Name)
 	}
-	if !strings.Contains(req.Tools[1].Description, "web_search") {
-		t.Errorf("builtin description = %q", req.Tools[1].Description)
+	if req.Tools[1].Description != "(builtin)" {
+		t.Errorf("builtin description = %q, want (builtin)", req.Tools[1].Description)
 	}
 }
 
