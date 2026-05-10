@@ -129,18 +129,21 @@ func cmdRun(args []string) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	env := append(os.Environ(),
-		"HTTPS_PROXY="+proxyURL,
-		"HTTP_PROXY="+proxyURL,
-		"https_proxy="+proxyURL,
-		"http_proxy="+proxyURL,
-		"NODE_EXTRA_CA_CERTS="+caCertPath,
-		"SSL_CERT_FILE="+caCertPath,
-		"REQUESTS_CA_BUNDLE="+caCertPath,
-		"CURL_CA_BUNDLE="+caCertPath,
-	)
+	// Only the env vars aig is adding. The runner merges with os.Environ
+	// for binary targets and forwards each via `open --env` for .app
+	// bundles (which need LaunchServices, not fork+exec).
+	extraEnv := []string{
+		"HTTPS_PROXY=" + proxyURL,
+		"HTTP_PROXY=" + proxyURL,
+		"https_proxy=" + proxyURL,
+		"http_proxy=" + proxyURL,
+		"NODE_EXTRA_CA_CERTS=" + caCertPath,
+		"SSL_CERT_FILE=" + caCertPath,
+		"REQUESTS_CA_BUNDLE=" + caCertPath,
+		"CURL_CA_BUNDLE=" + caCertPath,
+	}
 
-	code, err := runner.Run(ctx, args, env)
+	code, err := runner.Run(ctx, args, extraEnv)
 	if err != nil {
 		logger.Error("child run failed", "err", err)
 		fmt.Fprintf(os.Stderr, "aig: child run failed: %v\n", err)
