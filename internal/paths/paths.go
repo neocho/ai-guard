@@ -68,3 +68,13 @@ func CapturesDB() (string, error) {
 	}
 	return filepath.Join(d, "captures.db"), nil
 }
+
+// RulesFile returns the absolute path to ~/.aig/rules.yaml, the optional
+// scanner config that augments the built-in rule set.
+func RulesFile() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "rules.yaml"), nil
+}

@@ -113,11 +113,18 @@ func cmdRun(args []string) int {
 		"mitm", true,
 	)
 
+	scn, err := loadScanner(logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aig: %s\naig: fix the config and try again\n", err)
+		return 1
+	}
+
 	p := proxy.New(proxy.Options{
 		SessionID: sessionID,
 		Logger:    logger,
 		Mint:      minter.CertFor,
 		Store:     captures,
+		Scanner:   scn,
 	})
 
 	go func() {

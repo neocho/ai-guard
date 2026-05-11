@@ -16,6 +16,7 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"io"
 	"log/slog"
@@ -30,6 +31,8 @@ import (
 
 	"golang.org/x/net/http2"
 
+	"github.com/neocho/ai-guard/internal/parse"
+	"github.com/neocho/ai-guard/internal/scanner"
 	"github.com/neocho/ai-guard/internal/store"
 )
 
@@ -54,6 +57,11 @@ type Options struct {
 	// internal/store. Passthrough connections are not captured (we don't
 	// see their content).
 	Store *store.Store
+	// Scanner, if non-nil, scans every request body (outbound) and
+	// reassembled response content (inbound) before the capture is
+	// appended. Findings are stored alongside the capture; the scanner
+	// does not block forwarding — that's T-011 (policy engine).
+	Scanner *scanner.Scanner
 }
 
 // Proxy is an HTTP CONNECT proxy. Construct with New, then call Serve(ln).
@@ -335,6 +343,35 @@ func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, req
 	if p.opts.Store == nil {
 		return
 	}
+
+	// Eager parse: turn raw bytes into structured request/response so the
+	// scanner has clean strings to look at (raw SSE is fragmented across
+	// `data:` lines; regex on it misses chunk-spanning matches). The
+	// parsed result is stored too — saves re-parsing on every API read.
+	parsedReq, parsedResp := parse.Dispatch(host, r.URL.Path, reqBody, respBody)
+	parse.NormalizeRequest(parsedReq)
+	parse.NormalizeResponse(parsedResp)
+
+	var findings []scanner.Finding
+	if p.opts.Scanner != nil {
+		// Outbound: scan raw request body. Request bodies are non-streaming
+		// JSON so regex on raw bytes works fine.
+		findings = append(findings, p.opts.Scanner.Scan(reqBody, scanner.DirectionOutbound, "req_body")...)
+		// Inbound: scan the reassembled response content per-string. This
+		// is where chunk-spanning matters; scanning raw resp bytes would
+		// miss a "rm -rf /" split across two text_deltas.
+		findings = append(findings, scanInboundFromResponse(p.opts.Scanner, parsedResp)...)
+	}
+
+	for _, f := range findings {
+		if f.Severity == scanner.SeverityHigh {
+			p.opts.Logger.Warn("finding",
+				"rule", f.Rule, "severity", f.Severity, "direction", f.Direction,
+				"host", host, "path", r.URL.Path, "session_id", p.opts.SessionID,
+				"source", f.Source)
+		}
+	}
+
 	p.opts.Store.Append(&store.Capture{
 		SessionID:   p.opts.SessionID,
 		PID:         os.Getpid(),
@@ -349,7 +386,69 @@ func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, req
 		RespBody:    respBody,
 		DurationMS:  time.Since(start).Milliseconds(),
 		ALPN:        r.Proto,
+		Findings:    encodeJSONString(findings),
+		ParsedReq:   encodeJSONString(parsedReq),
+		ParsedResp:  encodeJSONString(parsedResp),
 	})
+}
+
+// scanInboundFromResponse walks the structured response and scans each
+// human-visible string independently. Two sources we care about:
+//
+//   - Text block content (the model's natural-language output)
+//   - Tool-use input fields (the model's structured call args; this is
+//     where "run rm -rf /" would live)
+//
+// We don't scan thinking blocks (encoded signatures, not human content)
+// or block-meta fields (ids, indices).
+func scanInboundFromResponse(s *scanner.Scanner, resp *parse.Response) []scanner.Finding {
+	if s == nil || resp == nil {
+		return nil
+	}
+	var out []scanner.Finding
+	for i, b := range resp.Content {
+		switch {
+		case b.Text != "":
+			src := fmt.Sprintf("resp.content[%d].text", i)
+			out = append(out, s.Scan([]byte(b.Text), scanner.DirectionInbound, src)...)
+		case b.ToolUse != nil:
+			// Scan the whole JSON input value as one string. Catches
+			// `{"command":"rm -rf /"}` style matches without needing to
+			// recursively walk every nested JSON field.
+			src := fmt.Sprintf("resp.content[%d].tool_use[%s].input", i, b.ToolUse.Name)
+			out = append(out, s.Scan(b.ToolUse.Input, scanner.DirectionInbound, src)...)
+		}
+	}
+	return out
+}
+
+// encodeJSONString marshals v to a JSON string. Returns "" if v is nil or
+// encoding fails (we'd rather store null than crash the proxy).
+func encodeJSONString(v any) string {
+	if v == nil {
+		return ""
+	}
+	// Sniff for typed nils so the caller can pass *parse.Request without
+	// each call checking. Reflect-free path for the common case.
+	switch x := v.(type) {
+	case *parse.Request:
+		if x == nil {
+			return ""
+		}
+	case *parse.Response:
+		if x == nil {
+			return ""
+		}
+	case []scanner.Finding:
+		if len(x) == 0 {
+			return ""
+		}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // hopByHopHeaders are not forwarded across the proxy boundary (RFC 7230 §6.1).

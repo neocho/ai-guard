@@ -36,6 +36,18 @@ type Capture struct {
 	DurationMS  int64
 	ALPN        string // "h2", "http/1.1", or ""
 	Truncated   bool   // true if either body was capped at MaxBodyBytes
+
+	// Eager-computed enrichment, set by the proxy before Append:
+	//   - Findings:   JSON-encoded []scanner.Finding (or "" / "[]" if none)
+	//   - ParsedReq:  JSON-encoded *parse.Request    (or "" if unparseable)
+	//   - ParsedResp: JSON-encoded *parse.Response   (or "" if unparseable)
+	//
+	// Store doesn't import scanner/parse — the proxy does the encoding so
+	// the store stays a dumb byte-bucket. These columns are nullable on
+	// disk to allow rows from older versions to coexist.
+	Findings   string
+	ParsedReq  string
+	ParsedResp string
 }
 
 // MaxBodyBytes caps inline body storage. Bodies larger than this are
@@ -84,6 +96,10 @@ func Open(path string, opts Options) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
 	s := &Store{
@@ -206,16 +222,21 @@ func scanCapture(rows *sql.Rows) (*Capture, error) {
 	c := &Capture{}
 	var ts int64
 	var truncated int
+	var findings, parsedReq, parsedResp sql.NullString
 	if err := rows.Scan(
 		&c.ID, &c.SessionID, &c.PID, &ts, &c.Host,
 		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
 		&c.RespStatus, &c.RespHeaders, &c.RespBody,
 		&c.DurationMS, &c.ALPN, &truncated,
+		&findings, &parsedReq, &parsedResp,
 	); err != nil {
 		return nil, err
 	}
 	c.Timestamp = time.Unix(0, ts)
 	c.Truncated = truncated != 0
+	c.Findings = findings.String
+	c.ParsedReq = parsedReq.String
+	c.ParsedResp = parsedResp.String
 	return c, nil
 }
 
@@ -223,16 +244,21 @@ func scanCaptureRow(row *sql.Row) (*Capture, error) {
 	c := &Capture{}
 	var ts int64
 	var truncated int
+	var findings, parsedReq, parsedResp sql.NullString
 	if err := row.Scan(
 		&c.SessionID, &c.PID, &ts, &c.Host,
 		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
 		&c.RespStatus, &c.RespHeaders, &c.RespBody,
 		&c.DurationMS, &c.ALPN, &truncated,
+		&findings, &parsedReq, &parsedResp,
 	); err != nil {
 		return nil, err
 	}
 	c.Timestamp = time.Unix(0, ts)
 	c.Truncated = truncated != 0
+	c.Findings = findings.String
+	c.ParsedReq = parsedReq.String
+	c.ParsedResp = parsedResp.String
 	return c, nil
 }
 
@@ -271,9 +297,58 @@ func (s *Store) write(c *Capture) error {
 		c.Method, c.Path, c.ReqHeaders, c.ReqBody,
 		c.RespStatus, c.RespHeaders, c.RespBody,
 		c.DurationMS, c.ALPN, c.Truncated,
+		nullable(c.Findings), nullable(c.ParsedReq), nullable(c.ParsedResp),
 	)
 	if err != nil {
 		return fmt.Errorf("insert: %w", err)
+	}
+	return nil
+}
+
+// nullable maps "" → sql.NullString{} so empty enrichment columns store
+// as NULL instead of empty strings (queries can use IS NULL).
+func nullable(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// migrate brings older databases up to the current column set. SQLite's
+// ALTER TABLE ADD COLUMN can't be made idempotent in pure SQL, so we read
+// table_info first and only add what's missing.
+func migrate(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(captures)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	cols := []struct{ name, decl string }{
+		{"findings", "TEXT"},
+		{"parsed_req", "TEXT"},
+		{"parsed_resp", "TEXT"},
+	}
+	for _, c := range cols {
+		if have[c.name] {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE captures ADD COLUMN %s %s", c.name, c.decl)); err != nil {
+			return fmt.Errorf("add column %s: %w", c.name, err)
+		}
 	}
 	return nil
 }
@@ -321,15 +396,17 @@ INSERT INTO captures (
     session_id, pid, ts, host,
     method, path, req_headers, req_body,
     resp_status, resp_headers, resp_body,
-    duration_ms, alpn, truncated
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    duration_ms, alpn, truncated,
+    findings, parsed_req, parsed_resp
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 const listSQL = `
 SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
-       duration_ms, alpn, truncated
+       duration_ms, alpn, truncated,
+       findings, parsed_req, parsed_resp
 FROM captures
 ORDER BY id DESC
 LIMIT ?
@@ -339,7 +416,8 @@ const listBeforeSQL = `
 SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
-       duration_ms, alpn, truncated
+       duration_ms, alpn, truncated,
+       findings, parsed_req, parsed_resp
 FROM captures
 WHERE id < ?
 ORDER BY id DESC
@@ -350,7 +428,8 @@ const listSinceSQL = `
 SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
-       duration_ms, alpn, truncated
+       duration_ms, alpn, truncated,
+       findings, parsed_req, parsed_resp
 FROM captures
 WHERE id > ?
 ORDER BY id ASC
@@ -361,7 +440,8 @@ const getSQL = `
 SELECT session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
-       duration_ms, alpn, truncated
+       duration_ms, alpn, truncated,
+       findings, parsed_req, parsed_resp
 FROM captures
 WHERE id = ?
 `

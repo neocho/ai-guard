@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/neocho/ai-guard/internal/parse"
+	"github.com/neocho/ai-guard/internal/scanner"
 	"github.com/neocho/ai-guard/internal/store"
 )
 
@@ -71,20 +72,22 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 // --- Endpoint: GET /api/captures ---
 
 type listItem struct {
-	ID         int64  `json:"id"`
-	SessionID  string `json:"session_id"`
-	Timestamp  string `json:"timestamp"`
-	PID        int    `json:"pid"`
-	Host       string `json:"host"`
-	Method     string `json:"method"`
-	Path       string `json:"path"`
-	RespStatus int    `json:"resp_status"`
-	DurationMS int64  `json:"duration_ms"`
-	ALPN       string `json:"alpn"`
-	ReqSize    int    `json:"req_size"`
-	RespSize   int    `json:"resp_size"`
-	Truncated  bool   `json:"truncated"`
-	Provider   string `json:"provider,omitempty"`
+	ID            int64  `json:"id"`
+	SessionID     string `json:"session_id"`
+	Timestamp     string `json:"timestamp"`
+	PID           int    `json:"pid"`
+	Host          string `json:"host"`
+	Method        string `json:"method"`
+	Path          string `json:"path"`
+	RespStatus    int    `json:"resp_status"`
+	DurationMS    int64  `json:"duration_ms"`
+	ALPN          string `json:"alpn"`
+	ReqSize       int    `json:"req_size"`
+	RespSize      int    `json:"resp_size"`
+	Truncated     bool   `json:"truncated"`
+	Provider      string `json:"provider,omitempty"`
+	FindingsCount int    `json:"findings_count"`
+	MaxSeverity   string `json:"max_severity,omitempty"`
 }
 
 type listResponse struct {
@@ -126,14 +129,15 @@ func (s *Server) handleListCaptures(w http.ResponseWriter, r *http.Request) {
 
 type detailResponse struct {
 	listItem
-	ReqHeaders  json.RawMessage `json:"req_headers,omitempty"`
-	ReqBody     string          `json:"req_body,omitempty"`
-	ReqBodyB64  string          `json:"req_body_base64,omitempty"`
-	RespHeaders json.RawMessage `json:"resp_headers,omitempty"`
-	RespBody    string          `json:"resp_body,omitempty"`
-	RespBodyB64 string          `json:"resp_body_base64,omitempty"`
-	Request     *parse.Request  `json:"request,omitempty"`
-	Response    *parse.Response `json:"response,omitempty"`
+	ReqHeaders  json.RawMessage   `json:"req_headers,omitempty"`
+	ReqBody     string            `json:"req_body,omitempty"`
+	ReqBodyB64  string            `json:"req_body_base64,omitempty"`
+	RespHeaders json.RawMessage   `json:"resp_headers,omitempty"`
+	RespBody    string            `json:"resp_body,omitempty"`
+	RespBodyB64 string            `json:"resp_body_base64,omitempty"`
+	Request     *parse.Request    `json:"request,omitempty"`
+	Response    *parse.Response   `json:"response,omitempty"`
+	Findings    []scanner.Finding `json:"findings"`
 }
 
 func (s *Server) handleGetCapture(w http.ResponseWriter, r *http.Request) {
@@ -157,9 +161,9 @@ func (s *Server) handleGetCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parsedReq, parsedResp := dispatchParse(c.Host, c.Path, c.ReqBody, c.RespBody)
-	normalizeRequest(parsedReq)
-	normalizeResponse(parsedResp)
+	parsedReq, parsedResp := loadParsedOrDispatch(c)
+	parse.NormalizeRequest(parsedReq)
+	parse.NormalizeResponse(parsedResp)
 
 	d := detailResponse{
 		listItem:    captureToListItem(c),
@@ -167,6 +171,7 @@ func (s *Server) handleGetCapture(w http.ResponseWriter, r *http.Request) {
 		RespHeaders: json.RawMessage(c.RespHeaders),
 		Request:     parsedReq,
 		Response:    parsedResp,
+		Findings:    decodeFindings(c.Findings),
 	}
 	if utf8.Valid(c.ReqBody) {
 		d.ReqBody = string(c.ReqBody)
@@ -244,26 +249,64 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 // --- helpers ---
 
 func captureToListItem(c *store.Capture) listItem {
+	findings := decodeFindings(c.Findings)
 	return listItem{
-		ID:         c.ID,
-		SessionID:  c.SessionID,
-		Timestamp:  c.Timestamp.UTC().Format(time.RFC3339Nano),
-		PID:        c.PID,
-		Host:       c.Host,
-		Method:     c.Method,
-		Path:       c.Path,
-		RespStatus: c.RespStatus,
-		DurationMS: c.DurationMS,
-		ALPN:       c.ALPN,
-		ReqSize:    len(c.ReqBody),
-		RespSize:   len(c.RespBody),
-		Truncated:  c.Truncated,
-		Provider:   providerOf(c.Host, c.Path),
+		ID:            c.ID,
+		SessionID:     c.SessionID,
+		Timestamp:     c.Timestamp.UTC().Format(time.RFC3339Nano),
+		PID:           c.PID,
+		Host:          c.Host,
+		Method:        c.Method,
+		Path:          c.Path,
+		RespStatus:    c.RespStatus,
+		DurationMS:    c.DurationMS,
+		ALPN:          c.ALPN,
+		ReqSize:       len(c.ReqBody),
+		RespSize:      len(c.RespBody),
+		Truncated:     c.Truncated,
+		Provider:      providerOf(c.Host, c.Path),
+		FindingsCount: len(findings),
+		MaxSeverity:   maxSeverity(findings),
 	}
 }
 
+// decodeFindings parses the JSON-encoded findings string. Returns empty
+// (never nil — Mac client expects [] not null) on missing or invalid.
+func decodeFindings(s string) []scanner.Finding {
+	if s == "" {
+		return []scanner.Finding{}
+	}
+	var out []scanner.Finding
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return []scanner.Finding{}
+	}
+	if out == nil {
+		return []scanner.Finding{}
+	}
+	return out
+}
+
+// maxSeverity returns the highest severity among findings, or "" if none.
+// Severity order: high > medium > low.
+func maxSeverity(fs []scanner.Finding) string {
+	rank := map[scanner.Severity]int{
+		scanner.SeverityHigh:   3,
+		scanner.SeverityMedium: 2,
+		scanner.SeverityLow:    1,
+	}
+	var best scanner.Severity
+	bestRank := 0
+	for _, f := range fs {
+		if rank[f.Severity] > bestRank {
+			best = f.Severity
+			bestRank = rank[f.Severity]
+		}
+	}
+	return string(best)
+}
+
 func providerOf(host, path string) string {
-	h := stripPort(host)
+	h := stripPortLocal(host)
 	switch {
 	case h == "api.anthropic.com" && path == "/v1/messages":
 		return parse.ProviderAnthropic
@@ -271,6 +314,44 @@ func providerOf(host, path string) string {
 		return parse.ProviderOpenAI
 	}
 	return ""
+}
+
+// stripPortLocal keeps the (host, _) helper local to this file. Mirror of
+// parse.stripPort which is unexported. Trivial enough to duplicate.
+func stripPortLocal(host string) string {
+	for i := len(host) - 1; i >= 0; i-- {
+		if host[i] == ':' {
+			return host[:i]
+		}
+		if host[i] < '0' || host[i] > '9' {
+			return host
+		}
+	}
+	return host
+}
+
+// loadParsedOrDispatch returns the parsed request/response for c. Prefers
+// the eagerly-stored ParsedReq/ParsedResp (proxy-side parse, T-010). Falls
+// back to live parsing for legacy rows that predate the columns.
+func loadParsedOrDispatch(c *store.Capture) (*parse.Request, *parse.Response) {
+	var req *parse.Request
+	var resp *parse.Response
+	if c.ParsedReq != "" {
+		var r parse.Request
+		if err := json.Unmarshal([]byte(c.ParsedReq), &r); err == nil {
+			req = &r
+		}
+	}
+	if c.ParsedResp != "" {
+		var r parse.Response
+		if err := json.Unmarshal([]byte(c.ParsedResp), &r); err == nil {
+			resp = &r
+		}
+	}
+	if req == nil && resp == nil {
+		return parse.Dispatch(c.Host, c.Path, c.ReqBody, c.RespBody)
+	}
+	return req, resp
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

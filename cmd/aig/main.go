@@ -21,6 +21,8 @@ func main() {
 		os.Exit(cmdUninstallCert(os.Args[2:]))
 	case "cert-status":
 		os.Exit(cmdCertStatus(os.Args[2:]))
+	case "rules":
+		os.Exit(cmdRules(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		os.Exit(0)
@@ -40,6 +42,7 @@ commands:
   install-cert           install aig's CA into the login keychain (trusted for SSL)
   uninstall-cert         remove aig's CA from the login keychain
   cert-status            show CA file + keychain install + trust status
+  rules <subcommand>     manage scanner rules (e.g. "aig rules list")
 
 flags:
   -h, --help             show this help`)
