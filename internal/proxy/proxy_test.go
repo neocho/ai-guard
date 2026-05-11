@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/neocho/ai-guard/internal/ca"
 	"github.com/neocho/ai-guard/internal/proxy"
+	"github.com/neocho/ai-guard/internal/scanner"
 	"github.com/neocho/ai-guard/internal/store"
 )
 
@@ -273,4 +275,113 @@ func newCA(t *testing.T) *ca.CA {
 		t.Fatalf("ca: %v", err)
 	}
 	return c
+}
+
+// TestMITM_BlocksOnPolicyAction verifies T-011: when a scanner rule with
+// action=block matches the request body, the proxy returns 403 and never
+// forwards upstream. The capture row is still written, with decision=blocked.
+func TestMITM_BlocksOnPolicyAction(t *testing.T) {
+	var upstreamHits int
+	var hitsMu sync.Mutex
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsMu.Lock()
+		upstreamHits++
+		hitsMu.Unlock()
+		fmt.Fprint(w, "should not see this")
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+
+	upstreamPool := x509.NewCertPool()
+	upstreamPool.AddCert(upstream.Certificate())
+
+	caInst := newCA(t)
+	minter := ca.NewMinter(caInst)
+
+	storeDir := t.TempDir()
+	s, err := store.Open(filepath.Join(storeDir, "captures.db"), store.Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	rule := scanner.Rule{
+		ID:        "test_secret",
+		Pattern:   regexp.MustCompile(`SECRET-[A-Z]+`),
+		Severity:  scanner.SeverityHigh,
+		Direction: scanner.DirectionOutbound,
+		Action:    scanner.ActionBlock,
+	}
+	scn := scanner.New([]scanner.Rule{rule})
+
+	proxyAddr := startProxy(t, proxy.Options{
+		Mint:              minter.CertFor,
+		UpstreamTLSConfig: &tls.Config{RootCAs: upstreamPool},
+		Store:             s,
+		Scanner:           scn,
+		IsScannable:       func(host, path string) bool { return true },
+	})
+
+	clientPool := x509.NewCertPool()
+	clientPool.AddCert(caInst.Cert)
+	proxyURL, _ := url.Parse("http://" + proxyAddr)
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    clientPool,
+				NextProtos: []string{"h2", "http/1.1"},
+			},
+			ForceAttemptHTTP2: true,
+		},
+	}
+
+	// Valid JSON body with a SECRET-X substring — ScanJSON walks string leaves.
+	body := []byte(`{"prompt":"the answer is SECRET-ABCDEF, do not share"}`)
+	resp, err := httpClient.Post(upstream.URL+"/v1/test", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(respBody), "blocked by rule") || !strings.Contains(string(respBody), "test_secret") {
+		t.Errorf("body = %q, want it to mention blocked + rule id", respBody)
+	}
+	hitsMu.Lock()
+	hits := upstreamHits
+	hitsMu.Unlock()
+	if hits != 0 {
+		t.Errorf("upstream was hit %d times — block should have short-circuited", hits)
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Flush(flushCtx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	captures, err := s.List(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(captures) == 0 {
+		t.Fatalf("expected at least one capture, got 0")
+	}
+	c := captures[0]
+	if c.RespStatus != http.StatusForbidden {
+		t.Errorf("capture resp_status = %d, want 403", c.RespStatus)
+	}
+	if c.Decision != "blocked" {
+		t.Errorf("capture decision = %q, want blocked", c.Decision)
+	}
+	if !strings.Contains(c.Findings, "test_secret") {
+		t.Errorf("capture findings should mention test_secret, got %s", c.Findings)
+	}
 }

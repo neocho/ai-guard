@@ -91,6 +91,7 @@ type listItem struct {
 	Provider      string `json:"provider,omitempty"`
 	FindingsCount int    `json:"findings_count"`
 	MaxSeverity   string `json:"max_severity,omitempty"`
+	Decision      string `json:"decision,omitempty"`
 }
 
 type listResponse struct {
@@ -256,6 +257,7 @@ type rulesResponseItem struct {
 	Description string `json:"description"`
 	Severity    string `json:"severity"`
 	Direction   string `json:"direction"`
+	Action      string `json:"action"`
 	Enabled     bool   `json:"enabled"`
 }
 
@@ -290,11 +292,16 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rule := range cfg.Rules {
 		enabled := rule.Enabled == nil || *rule.Enabled
+		action := rule.Action
+		if action == "" {
+			action = string(scanner.DefaultAction)
+		}
 		out.Rules = append(out.Rules, rulesResponseItem{
 			ID:          rule.ID,
 			Description: rule.Description,
 			Severity:    rule.Severity,
 			Direction:   rule.Direction,
+			Action:      action,
 			Enabled:     enabled,
 		})
 	}
@@ -335,6 +342,25 @@ func (s *Server) handleRuleItem(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": enabled})
 
+	case r.Method == http.MethodPost && action == "action":
+		var body struct {
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := scanner.SetRuleAction(rulesPath, id, body.Action); err != nil {
+			// 400 for "invalid action" enum, 404 for missing rule.
+			if strings.Contains(err.Error(), "invalid action") {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			} else {
+				http.Error(w, err.Error(), http.StatusNotFound)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "action": body.Action})
+
 	case r.Method == http.MethodDelete && action == "":
 		if err := scanner.DeleteRule(rulesPath, id); err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -368,6 +394,7 @@ func captureToListItem(c *store.Capture) listItem {
 		Provider:      providerOf(c.Host, c.Path),
 		FindingsCount: len(findings),
 		MaxSeverity:   maxSeverity(findings),
+		Decision:      c.Decision,
 	}
 }
 

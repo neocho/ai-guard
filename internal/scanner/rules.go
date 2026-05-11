@@ -26,11 +26,15 @@ func DefaultRules() []Rule {
 			Severity:    SeverityHigh,
 			Direction:   DirectionOutbound,
 		},
-		// OpenAI API key. sk-, sk-proj-, sk-svcacct- variants.
+		// OpenAI API key. sk-proj- or sk-svcacct- prefix is required —
+		// legacy plain `sk-` keys (pre-2024) are excluded so the pattern
+		// can't false-match Anthropic's sk-ant-* format. OpenAI has been
+		// migrating dashboards to sk-proj- since 2024; live keys today
+		// almost all carry the prefix.
 		{
 			ID:          "openai_key",
-			Description: "OpenAI API key",
-			Pattern:     regexp.MustCompile(`\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}\b`),
+			Description: "OpenAI API key (sk-proj- / sk-svcacct-)",
+			Pattern:     regexp.MustCompile(`\bsk-(?:proj|svcacct)-[A-Za-z0-9_-]{32,}\b`),
 			Severity:    SeverityHigh,
 			Direction:   DirectionOutbound,
 		},

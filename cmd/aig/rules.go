@@ -48,17 +48,21 @@ func cmdRulesList(_ []string) int {
 	})
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSEV\tDIR\tENABLED\tDESCRIPTION")
+	fmt.Fprintln(w, "ID\tSEV\tDIR\tACTION\tENABLED\tDESCRIPTION")
 	for _, r := range rules {
 		enabled := "yes"
 		if r.Enabled != nil && !*r.Enabled {
 			enabled = "no"
 		}
+		action := r.Action
+		if action == "" {
+			action = string(scanner.DefaultAction)
+		}
 		desc := r.Description
 		if desc == "" {
 			desc = "—"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Direction, enabled, desc)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Direction, action, enabled, desc)
 	}
 	_ = w.Flush()
 

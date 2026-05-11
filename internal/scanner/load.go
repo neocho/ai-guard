@@ -15,8 +15,8 @@ type ConfigFile struct {
 	Rules []ConfigRule `yaml:"rules"`
 }
 
-// ConfigRule is one entry in the rules.yaml file. Description and Enabled
-// are optional; the others are required.
+// ConfigRule is one entry in the rules.yaml file. Description, Enabled,
+// and Action are optional; the others are required.
 type ConfigRule struct {
 	ID          string `yaml:"id"`
 	Description string `yaml:"description,omitempty"`
@@ -27,6 +27,9 @@ type ConfigRule struct {
 	// only an explicit `enabled: false` disables the rule. yaml.v3
 	// preserves this on marshal: omitted when nil, present when set.
 	Enabled *bool `yaml:"enabled,omitempty"`
+	// Action defaults to DefaultAction ("warn") when omitted. Validated
+	// at load time — invalid values hard-fail.
+	Action string `yaml:"action,omitempty"`
 }
 
 // LoadConfig reads rules.yaml and returns the compiled rules. There is
@@ -82,6 +85,10 @@ func LoadConfig(path string, logger *slog.Logger) ([]Rule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: rule '%s': %w", path, cr.ID, err)
 		}
+		act, err := parseAction(cr.Action)
+		if err != nil {
+			return nil, fmt.Errorf("%s: rule '%s': %w", path, cr.ID, err)
+		}
 		re, err := regexp.Compile(cr.Pattern)
 		if err != nil {
 			logger.Warn("scanner: invalid regex, skipping rule",
@@ -94,6 +101,7 @@ func LoadConfig(path string, logger *slog.Logger) ([]Rule, error) {
 			Pattern:     re,
 			Severity:    sev,
 			Direction:   dir,
+			Action:      act,
 		})
 	}
 	return rules, nil
@@ -152,6 +160,30 @@ func ToggleRule(path, id string) (bool, error) {
 	return false, fmt.Errorf("rule %q not found", id)
 }
 
+// SetRuleAction updates a rule's action in the YAML. action must be
+// one of "allow", "warn", "block". An empty action means "use the
+// default" — we remove the field rather than store the empty value, so
+// the file stays clean.
+func SetRuleAction(path, id, action string) error {
+	if action != "" {
+		if _, err := parseAction(action); err != nil {
+			return err
+		}
+	}
+	cfg, err := LoadConfigRaw(path)
+	if err != nil {
+		return err
+	}
+	for i, r := range cfg.Rules {
+		if r.ID != id {
+			continue
+		}
+		cfg.Rules[i].Action = action
+		return SaveConfig(path, cfg)
+	}
+	return fmt.Errorf("rule %q not found", id)
+}
+
 // DeleteRule removes a rule from the YAML by id.
 func DeleteRule(path, id string) error {
 	cfg, err := LoadConfigRaw(path)
@@ -189,34 +221,54 @@ func parseDirection(s string) (Direction, error) {
 	}
 }
 
+func parseAction(s string) (Action, error) {
+	switch Action(s) {
+	case ActionAllow, ActionWarn, ActionBlock:
+		return Action(s), nil
+	case "":
+		return DefaultAction, nil
+	default:
+		return "", fmt.Errorf("invalid action %q (must be allow|warn|block)", s)
+	}
+}
+
 // StarterConfig is the YAML body written to ~/.aig/rules.yaml on first
 // run (or when migrating from an earlier empty-rules version). No
 // comments — the file is machine-managed by the UI's toggle/delete
 // actions, which rewrite it on every change.
+//
+// Per-rule action defaults aim at "block what's almost certainly a
+// real secret, warn on probable-but-noisy patterns, silently record
+// emails." Users can flip any of these in the Mac UI.
 const StarterConfig = `rules:
   - id: anthropic_key
     description: Anthropic API key
     pattern: 'sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_\-]{80,}'
     severity: high
     direction: outbound
+    action: block
   - id: openai_key
-    description: OpenAI API key
-    pattern: 'sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}'
+    description: OpenAI API key (sk-proj- / sk-svcacct-)
+    pattern: 'sk-(?:proj|svcacct)-[A-Za-z0-9_-]{32,}'
     severity: high
     direction: outbound
+    action: block
   - id: private_key_pem
     description: PEM-encoded private key header
     pattern: '-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----'
     severity: high
     direction: outbound
+    action: block
   - id: jwt
     description: JSON Web Token (eyJ...eyJ...sig)
     pattern: 'eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'
     severity: medium
     direction: outbound
+    action: warn
   - id: email
     description: Email address
     pattern: '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}'
     severity: low
     direction: outbound
+    action: allow
 `

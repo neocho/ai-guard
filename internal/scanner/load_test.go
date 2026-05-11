@@ -102,6 +102,126 @@ func TestToggleRule_FlipsEnabled(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_ActionDefaultsToWarn(t *testing.T) {
+	// Rule has no action field — should default to warn.
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+`)
+	rules, err := scanner.LoadConfig(path, nil)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("want 1 rule, got %d", len(rules))
+	}
+	if rules[0].Action != scanner.ActionWarn {
+		t.Errorf("default action = %q, want %q", rules[0].Action, scanner.ActionWarn)
+	}
+}
+
+func TestLoadConfig_ActionInvalidErrors(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+    action: nope
+`)
+	_, err := scanner.LoadConfig(path, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid action, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid action") {
+		t.Errorf("error should mention invalid action, got %q", err.Error())
+	}
+}
+
+func TestLoadConfig_ActionCarriedThrough(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: a_block
+    pattern: 'A'
+    severity: high
+    direction: outbound
+    action: block
+  - id: b_allow
+    pattern: 'B'
+    severity: low
+    direction: outbound
+    action: allow
+`)
+	rules, err := scanner.LoadConfig(path, nil)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	byID := map[string]scanner.Action{}
+	for _, r := range rules {
+		byID[r.ID] = r.Action
+	}
+	if byID["a_block"] != scanner.ActionBlock {
+		t.Errorf("a_block action = %q, want %q", byID["a_block"], scanner.ActionBlock)
+	}
+	if byID["b_allow"] != scanner.ActionAllow {
+		t.Errorf("b_allow action = %q, want %q", byID["b_allow"], scanner.ActionAllow)
+	}
+}
+
+func TestSetRuleAction_RoundTrip(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+    action: warn
+`)
+	if err := scanner.SetRuleAction(path, "x", "block"); err != nil {
+		t.Fatalf("SetRuleAction: %v", err)
+	}
+	rules, _ := scanner.LoadConfig(path, nil)
+	if len(rules) != 1 || rules[0].Action != scanner.ActionBlock {
+		t.Fatalf("after SetRuleAction(block): got %+v", rules)
+	}
+	// Back to default by passing empty string.
+	if err := scanner.SetRuleAction(path, "x", ""); err != nil {
+		t.Fatalf("SetRuleAction empty: %v", err)
+	}
+	rules, _ = scanner.LoadConfig(path, nil)
+	if rules[0].Action != scanner.ActionWarn {
+		t.Errorf("after SetRuleAction(\"\"): action = %q, want default warn", rules[0].Action)
+	}
+}
+
+func TestSetRuleAction_InvalidAction(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+`)
+	err := scanner.SetRuleAction(path, "x", "destroy")
+	if err == nil {
+		t.Fatal("expected invalid-action error")
+	}
+	if !strings.Contains(err.Error(), "invalid action") {
+		t.Errorf("error should mention invalid action, got %q", err.Error())
+	}
+}
+
+func TestSetRuleAction_MissingRule(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+`)
+	err := scanner.SetRuleAction(path, "ghost", "block")
+	if err == nil {
+		t.Fatal("expected not-found error")
+	}
+}
+
 func TestDeleteRule_RemovesFromFile(t *testing.T) {
 	path := writeTemp(t, `rules:
   - id: keep

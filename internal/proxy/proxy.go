@@ -16,6 +16,7 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"io"
 	"log/slog"
@@ -58,9 +59,15 @@ type Options struct {
 	Store *store.Store
 	// Scanner, if non-nil, scans every request body (outbound) and
 	// reassembled response content (inbound) before the capture is
-	// appended. Findings are stored alongside the capture; the scanner
-	// does not block forwarding — that's T-011 (policy engine).
+	// appended. Findings are stored alongside the capture, and any
+	// finding with Action=block causes the proxy to return 403 instead
+	// of forwarding upstream.
 	Scanner *scanner.Scanner
+	// IsScannable gates which endpoints get scanned. Defaults to
+	// scanner.IsScannable (3-endpoint prompt allowlist) when nil.
+	// Tests override this to scan synthetic hosts; production callers
+	// generally leave it nil.
+	IsScannable func(host, path string) bool
 }
 
 // Proxy is an HTTP CONNECT proxy. Construct with New, then call Serve(ln).
@@ -266,9 +273,11 @@ func (c *closeSignalConn) Close() error {
 }
 
 // handleHTTPRequest is the per-HTTP-request handler used inside MITM mode.
-// It buffers the request body, makes the upstream call, streams the
-// response back to the client, and (if a Store is configured) appends a
-// Capture row covering both directions.
+// It buffers the request body, runs the outbound scan + policy check
+// (blocking with a 403 if a `block`-action finding fires), makes the
+// upstream call when allowed, streams the response back to the client,
+// scans the response, and (if a Store is configured) appends a Capture
+// row covering both directions.
 func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connectHost string) {
 	reqStart := time.Now()
 
@@ -278,6 +287,36 @@ func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connec
 		return
 	}
 	_ = r.Body.Close()
+
+	// Eager-parse the request so the scanner sees structured strings, not
+	// raw JSON bytes. parsedResp comes later, after upstream responds.
+	parsedReq, _ := parse.Dispatch(connectHost, r.URL.Path, reqBody, nil)
+	parse.NormalizeRequest(parsedReq)
+
+	// Outbound scan. Only fires on allowlisted endpoints — telemetry,
+	// oauth, mcp-registry, etc. flow through unscanned to keep the audit
+	// log complete without flooding the UI with noise.
+	var findings []scanner.Finding
+	scannable := p.opts.Scanner != nil && p.isScannable(connectHost, r.URL.Path)
+	if scannable {
+		findings = p.opts.Scanner.ScanJSON(reqBody, scanner.DirectionOutbound, "req")
+	}
+
+	// Policy: if any finding has Action=block, refuse to forward.
+	if blockedRule := scanner.FirstBlockingRule(findings); blockedRule != "" {
+		blockBody := []byte(fmt.Sprintf("aig: blocked by rule '%s'\n", blockedRule))
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write(blockBody)
+		p.logFindings(findings, connectHost, r.URL.Path)
+		p.opts.Logger.Warn("request blocked by policy",
+			"rule", blockedRule, "host", connectHost, "path", r.URL.Path,
+			"session_id", p.opts.SessionID)
+		p.appendCapture(reqStart, connectHost, r, reqBody,
+			http.StatusForbidden, w.Header(), blockBody,
+			parsedReq, nil, findings)
+		return
+	}
 
 	outURL := url.URL{
 		Scheme:   "https",
@@ -297,7 +336,7 @@ func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connec
 		p.opts.Logger.Warn("upstream roundtrip failed",
 			"host", connectHost, "err", err, "session_id", p.opts.SessionID)
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
-		p.appendCapture(reqStart, connectHost, r, reqBody, 0, nil, nil)
+		p.appendCapture(reqStart, connectHost, r, reqBody, 0, nil, nil, parsedReq, nil, findings)
 		return
 	}
 	defer resp.Body.Close()
@@ -313,7 +352,40 @@ func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connec
 	}
 
 	respBody := decompressIfNeeded(capBuf.Bytes(), resp.Header)
-	p.appendCapture(reqStart, connectHost, r, reqBody, resp.StatusCode, resp.Header, respBody)
+
+	// Inbound scan — walk the reassembled response, append findings.
+	_, parsedResp := parse.Dispatch(connectHost, r.URL.Path, nil, respBody)
+	parse.NormalizeResponse(parsedResp)
+	if scannable && parsedResp != nil {
+		if respJSON, err := json.Marshal(parsedResp); err == nil {
+			findings = append(findings, p.opts.Scanner.ScanJSON(respJSON, scanner.DirectionInbound, "resp")...)
+		}
+	}
+	p.logFindings(findings, connectHost, r.URL.Path)
+	p.appendCapture(reqStart, connectHost, r, reqBody,
+		resp.StatusCode, resp.Header, respBody,
+		parsedReq, parsedResp, findings)
+}
+
+// isScannable invokes the configured allowlist function or the default
+// scanner.IsScannable. Centralized so the handler doesn't repeat the
+// nil check.
+func (p *Proxy) isScannable(host, path string) bool {
+	if p.opts.IsScannable != nil {
+		return p.opts.IsScannable(host, path)
+	}
+	return scanner.IsScannable(host, path)
+}
+
+// logFindings prints a structured warn line per finding so a user
+// tail-ing aig.log can see what's firing in real time.
+func (p *Proxy) logFindings(findings []scanner.Finding, host, path string) {
+	for _, f := range findings {
+		p.opts.Logger.Warn("finding",
+			"rule", f.Rule, "severity", f.Severity, "action", f.Action,
+			"direction", f.Direction, "host", host, "path", path,
+			"session_id", p.opts.SessionID, "source", f.Source)
+	}
 }
 
 // decompressIfNeeded returns the logical (decompressed) body for capture
@@ -338,48 +410,18 @@ func decompressIfNeeded(body []byte, headers http.Header) []byte {
 	return out
 }
 
-func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, reqBody []byte, status int, respHeaders http.Header, respBody []byte) {
+// appendCapture writes one row to the store. Parse/scan happen earlier
+// in handleHTTPRequest so the policy check can short-circuit blocked
+// requests before the upstream call — this function just persists.
+func (p *Proxy) appendCapture(
+	start time.Time, host string, r *http.Request, reqBody []byte,
+	status int, respHeaders http.Header, respBody []byte,
+	parsedReq *parse.Request, parsedResp *parse.Response,
+	findings []scanner.Finding,
+) {
 	if p.opts.Store == nil {
 		return
 	}
-
-	// Eager parse: turn raw bytes into structured request/response so the
-	// scanner has clean strings to look at (raw SSE is fragmented across
-	// `data:` lines; regex on it misses chunk-spanning matches). The
-	// parsed result is stored too — saves re-parsing on every API read.
-	parsedReq, parsedResp := parse.Dispatch(host, r.URL.Path, reqBody, respBody)
-	parse.NormalizeRequest(parsedReq)
-	parse.NormalizeResponse(parsedResp)
-
-	// Only scan when the endpoint is on the allowlist. Captures still
-	// flow to the store regardless — non-allowlisted endpoints just have
-	// empty findings. Keeps the audit log complete without flooding the
-	// UI with noise from telemetry batches.
-	var findings []scanner.Finding
-	if p.opts.Scanner != nil && scanner.IsScannable(host, r.URL.Path) {
-		// Outbound: walk the parsed JSON body, scan every string leaf,
-		// tag with its JSON path (req.messages[0].content, req.system, ...).
-		findings = append(findings, p.opts.Scanner.ScanJSON(reqBody, scanner.DirectionOutbound, "req")...)
-		// Inbound: re-marshal the streaming-reassembled response into JSON,
-		// then walk the same way. Raw SSE bytes can't be regex'd directly —
-		// matches like "rm -rf /" can split across deltas. The parser has
-		// already done the reassembly; we just walk its output.
-		if parsedResp != nil {
-			if respJSON, err := json.Marshal(parsedResp); err == nil {
-				findings = append(findings, p.opts.Scanner.ScanJSON(respJSON, scanner.DirectionInbound, "resp")...)
-			}
-		}
-	}
-
-	for _, f := range findings {
-		if f.Severity == scanner.SeverityHigh {
-			p.opts.Logger.Warn("finding",
-				"rule", f.Rule, "severity", f.Severity, "direction", f.Direction,
-				"host", host, "path", r.URL.Path, "session_id", p.opts.SessionID,
-				"source", f.Source)
-		}
-	}
-
 	p.opts.Store.Append(&store.Capture{
 		SessionID:   p.opts.SessionID,
 		PID:         os.Getpid(),
@@ -397,6 +439,7 @@ func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, req
 		Findings:    encodeJSONString(findings),
 		ParsedReq:   encodeJSONString(parsedReq),
 		ParsedResp:  encodeJSONString(parsedResp),
+		Decision:    string(scanner.DeriveDecision(findings)),
 	})
 }
 

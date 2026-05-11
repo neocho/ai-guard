@@ -34,6 +34,71 @@ const (
 	SeverityLow    Severity = "low"    // PII/hint, rarely a leak by itself
 )
 
+// Action is what the proxy does when a finding from this rule fires.
+//   - allow:  record the finding, no notification, forward upstream
+//   - warn:   record + fire Mac notification, forward upstream
+//   - block:  return 403 to the agent, do not forward
+type Action string
+
+const (
+	ActionAllow Action = "allow"
+	ActionWarn  Action = "warn"
+	ActionBlock Action = "block"
+)
+
+// DefaultAction is what a rule gets when its `action` field is omitted.
+// Warn is the safe middle ground — finding fires a notification but
+// requests still go through. Users opt up to block per-rule.
+const DefaultAction Action = ActionWarn
+
+// Decision is the proxy's derived verdict for one capture, picked by
+// taking the strictest action across all findings (block > warn > allow).
+type Decision string
+
+const (
+	DecisionAllowed Decision = "allowed"
+	DecisionWarned  Decision = "warned"
+	DecisionBlocked Decision = "blocked"
+)
+
+// DeriveDecision picks the strictest action across findings.
+//   - Any block → blocked
+//   - Else any warn → warned
+//   - Else any allow → allowed
+//   - Empty findings → allowed (nothing fired)
+func DeriveDecision(findings []Finding) Decision {
+	hasWarn, hasAllow := false, false
+	for _, f := range findings {
+		switch f.Action {
+		case ActionBlock:
+			return DecisionBlocked
+		case ActionWarn:
+			hasWarn = true
+		case ActionAllow:
+			hasAllow = true
+		}
+	}
+	if hasWarn {
+		return DecisionWarned
+	}
+	if hasAllow {
+		return DecisionAllowed
+	}
+	return DecisionAllowed
+}
+
+// FirstBlockingRule returns the rule id of the first finding with
+// Action=block, used to compose the 403 body when the proxy refuses to
+// forward. Empty string if none.
+func FirstBlockingRule(findings []Finding) string {
+	for _, f := range findings {
+		if f.Action == ActionBlock {
+			return f.Rule
+		}
+	}
+	return ""
+}
+
 // Finding is one match a Rule produced.
 type Finding struct {
 	Rule      string    `json:"rule"`      // stable rule id, e.g. "aws_access_key"
@@ -42,6 +107,7 @@ type Finding struct {
 	Length    int       `json:"length"`    // length of the match in bytes
 	Severity  Severity  `json:"severity"`
 	Direction Direction `json:"direction"` // which side fired
+	Action    Action    `json:"action"`    // copied from the rule for downstream policy
 	// Source describes where in the capture the match came from, e.g.
 	// "req_body", "resp.text[0]", "resp.tool_use[1].command". Empty for raw scans.
 	Source string `json:"source,omitempty"`
@@ -54,6 +120,7 @@ type Rule struct {
 	Pattern     *regexp.Regexp
 	Severity    Severity
 	Direction   Direction
+	Action      Action
 	// Validate optionally filters regex matches. RE2 has no lookarounds,
 	// so rules like "SSN with valid area number" do that filtering here.
 	Validate func(match []byte) bool
@@ -118,6 +185,7 @@ func (s *Scanner) Scan(b []byte, dir Direction, source string) []Finding {
 				Length:    end - start,
 				Severity:  r.Severity,
 				Direction: dir,
+				Action:    r.Action,
 				Source:    source,
 			})
 		}

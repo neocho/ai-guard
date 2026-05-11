@@ -41,6 +41,7 @@ type Capture struct {
 	//   - Findings:   JSON-encoded []scanner.Finding (or "" / "[]" if none)
 	//   - ParsedReq:  JSON-encoded *parse.Request    (or "" if unparseable)
 	//   - ParsedResp: JSON-encoded *parse.Response   (or "" if unparseable)
+	//   - Decision:   "allowed" | "warned" | "blocked" (or "" for legacy rows)
 	//
 	// Store doesn't import scanner/parse — the proxy does the encoding so
 	// the store stays a dumb byte-bucket. These columns are nullable on
@@ -48,6 +49,7 @@ type Capture struct {
 	Findings   string
 	ParsedReq  string
 	ParsedResp string
+	Decision   string
 }
 
 // MaxBodyBytes caps inline body storage. Bodies larger than this are
@@ -222,13 +224,13 @@ func scanCapture(rows *sql.Rows) (*Capture, error) {
 	c := &Capture{}
 	var ts int64
 	var truncated int
-	var findings, parsedReq, parsedResp sql.NullString
+	var findings, parsedReq, parsedResp, decision sql.NullString
 	if err := rows.Scan(
 		&c.ID, &c.SessionID, &c.PID, &ts, &c.Host,
 		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
 		&c.RespStatus, &c.RespHeaders, &c.RespBody,
 		&c.DurationMS, &c.ALPN, &truncated,
-		&findings, &parsedReq, &parsedResp,
+		&findings, &parsedReq, &parsedResp, &decision,
 	); err != nil {
 		return nil, err
 	}
@@ -237,6 +239,7 @@ func scanCapture(rows *sql.Rows) (*Capture, error) {
 	c.Findings = findings.String
 	c.ParsedReq = parsedReq.String
 	c.ParsedResp = parsedResp.String
+	c.Decision = decision.String
 	return c, nil
 }
 
@@ -244,13 +247,13 @@ func scanCaptureRow(row *sql.Row) (*Capture, error) {
 	c := &Capture{}
 	var ts int64
 	var truncated int
-	var findings, parsedReq, parsedResp sql.NullString
+	var findings, parsedReq, parsedResp, decision sql.NullString
 	if err := row.Scan(
 		&c.SessionID, &c.PID, &ts, &c.Host,
 		&c.Method, &c.Path, &c.ReqHeaders, &c.ReqBody,
 		&c.RespStatus, &c.RespHeaders, &c.RespBody,
 		&c.DurationMS, &c.ALPN, &truncated,
-		&findings, &parsedReq, &parsedResp,
+		&findings, &parsedReq, &parsedResp, &decision,
 	); err != nil {
 		return nil, err
 	}
@@ -259,6 +262,7 @@ func scanCaptureRow(row *sql.Row) (*Capture, error) {
 	c.Findings = findings.String
 	c.ParsedReq = parsedReq.String
 	c.ParsedResp = parsedResp.String
+	c.Decision = decision.String
 	return c, nil
 }
 
@@ -298,6 +302,7 @@ func (s *Store) write(c *Capture) error {
 		c.RespStatus, c.RespHeaders, c.RespBody,
 		c.DurationMS, c.ALPN, c.Truncated,
 		nullable(c.Findings), nullable(c.ParsedReq), nullable(c.ParsedResp),
+		nullable(c.Decision),
 	)
 	if err != nil {
 		return fmt.Errorf("insert: %w", err)
@@ -341,6 +346,7 @@ func migrate(db *sql.DB) error {
 		{"findings", "TEXT"},
 		{"parsed_req", "TEXT"},
 		{"parsed_resp", "TEXT"},
+		{"decision", "TEXT"},
 	}
 	for _, c := range cols {
 		if have[c.name] {
@@ -397,8 +403,8 @@ INSERT INTO captures (
     method, path, req_headers, req_body,
     resp_status, resp_headers, resp_body,
     duration_ms, alpn, truncated,
-    findings, parsed_req, parsed_resp
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    findings, parsed_req, parsed_resp, decision
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 const listSQL = `
@@ -406,7 +412,7 @@ SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
        duration_ms, alpn, truncated,
-       findings, parsed_req, parsed_resp
+       findings, parsed_req, parsed_resp, decision
 FROM captures
 ORDER BY id DESC
 LIMIT ?
@@ -417,7 +423,7 @@ SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
        duration_ms, alpn, truncated,
-       findings, parsed_req, parsed_resp
+       findings, parsed_req, parsed_resp, decision
 FROM captures
 WHERE id < ?
 ORDER BY id DESC
@@ -429,7 +435,7 @@ SELECT id, session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
        duration_ms, alpn, truncated,
-       findings, parsed_req, parsed_resp
+       findings, parsed_req, parsed_resp, decision
 FROM captures
 WHERE id > ?
 ORDER BY id ASC
@@ -441,7 +447,7 @@ SELECT session_id, pid, ts, host,
        method, path, req_headers, req_body,
        resp_status, resp_headers, resp_body,
        duration_ms, alpn, truncated,
-       findings, parsed_req, parsed_resp
+       findings, parsed_req, parsed_resp, decision
 FROM captures
 WHERE id = ?
 `
