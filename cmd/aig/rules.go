@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"sort"
 	"text/tabwriter"
@@ -27,8 +26,9 @@ func cmdRules(args []string) int {
 	}
 }
 
-// cmdRulesList prints the merged rule set (built-ins + user) in tabular
-// form. Source column says where each rule came from.
+// cmdRulesList prints every rule in rules.yaml (including disabled ones)
+// in tabular form. The ENABLED column is "yes" or "no" so you can spot
+// silenced rules without grepping the YAML.
 func cmdRulesList(_ []string) int {
 	rulesPath, err := paths.RulesFile()
 	if err != nil {
@@ -36,48 +36,36 @@ func cmdRulesList(_ []string) int {
 		return 1
 	}
 
-	// Silent logger — bad-regex warnings are noise for `rules list`.
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-
-	rules, err := scanner.LoadConfig(rulesPath, logger)
+	cfg, err := scanner.LoadConfigRaw(rulesPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aig rules list: %v\n", err)
 		return 1
 	}
 
-	builtIns := map[string]bool{}
-	for _, r := range scanner.DefaultRules() {
-		builtIns[r.ID] = true
-	}
-
-	// Stable order: built-in alphabetical, then user alphabetical.
+	rules := cfg.Rules
 	sort.Slice(rules, func(i, j int) bool {
-		bi, bj := builtIns[rules[i].ID], builtIns[rules[j].ID]
-		if bi != bj {
-			return bi
-		}
 		return rules[i].ID < rules[j].ID
 	})
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSEV\tDIR\tSOURCE\tDESCRIPTION")
+	fmt.Fprintln(w, "ID\tSEV\tDIR\tENABLED\tDESCRIPTION")
 	for _, r := range rules {
-		src := "user"
-		if builtIns[r.ID] {
-			src = "built-in"
+		enabled := "yes"
+		if r.Enabled != nil && !*r.Enabled {
+			enabled = "no"
 		}
 		desc := r.Description
 		if desc == "" {
 			desc = "—"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Direction, src, desc)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Direction, enabled, desc)
 	}
 	_ = w.Flush()
 
 	if _, err := os.Stat(rulesPath); err == nil {
-		fmt.Fprintf(os.Stdout, "\n%d rules loaded (config: %s)\n", len(rules), rulesPath)
+		fmt.Fprintf(os.Stdout, "\n%d rules in %s\n", len(rules), rulesPath)
 	} else {
-		fmt.Fprintf(os.Stdout, "\n%d rules loaded (no user config at %s)\n", len(rules), rulesPath)
+		fmt.Fprintf(os.Stdout, "\nno config at %s (run `aig run <cmd>` once to bootstrap)\n", rulesPath)
 	}
 	return 0
 }

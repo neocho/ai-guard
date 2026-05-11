@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/neocho/ai-guard/internal/parse"
+	"github.com/neocho/ai-guard/internal/paths"
 	"github.com/neocho/ai-guard/internal/scanner"
 	"github.com/neocho/ai-guard/internal/store"
 )
@@ -39,6 +40,8 @@ func New(s *store.Store, logger *slog.Logger) *Server {
 	srv.mux.HandleFunc("/api/captures", srv.handleListCaptures)
 	srv.mux.HandleFunc("/api/captures/", srv.handleGetCapture)
 	srv.mux.HandleFunc("/api/stream", srv.handleStream)
+	srv.mux.HandleFunc("/api/rules", srv.handleRules)
+	srv.mux.HandleFunc("/api/rules/", srv.handleRuleItem)
 	return srv
 }
 
@@ -243,6 +246,104 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		}
+	}
+}
+
+// --- Endpoint: GET /api/rules ---
+
+type rulesResponseItem struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Severity    string `json:"severity"`
+	Direction   string `json:"direction"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type rulesResponse struct {
+	Rules      []rulesResponseItem `json:"rules"`
+	Endpoints  []scanner.Endpoint  `json:"endpoints"`
+	ConfigPath string              `json:"config_path"`
+}
+
+// handleRules returns the rule set as it lives in YAML — every rule,
+// including disabled ones (UI needs to render their toggle state).
+func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rulesPath, err := paths.RulesFile()
+	if err != nil {
+		http.Error(w, "rules path: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	cfg, err := scanner.LoadConfigRaw(rulesPath)
+	if err != nil {
+		s.logger.Warn("rules load failed", "err", err)
+		cfg = &scanner.ConfigFile{}
+	}
+
+	out := rulesResponse{
+		Endpoints:  scanner.ScannableEndpoints(),
+		ConfigPath: rulesPath,
+		Rules:      []rulesResponseItem{},
+	}
+	for _, rule := range cfg.Rules {
+		enabled := rule.Enabled == nil || *rule.Enabled
+		out.Rules = append(out.Rules, rulesResponseItem{
+			ID:          rule.ID,
+			Description: rule.Description,
+			Severity:    rule.Severity,
+			Direction:   rule.Direction,
+			Enabled:     enabled,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleRuleItem routes per-rule actions:
+//
+//   POST   /api/rules/{id}/toggle  → flip enabled state
+//   DELETE /api/rules/{id}         → remove rule from YAML
+func (s *Server) handleRuleItem(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/rules/")
+	if rest == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	rulesPath, err := paths.RulesFile()
+	if err != nil {
+		http.Error(w, "rules path: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Path forms: "{id}" or "{id}/toggle". Use the last "/" to split.
+	id := rest
+	action := ""
+	if i := strings.Index(rest, "/"); i >= 0 {
+		id = rest[:i]
+		action = rest[i+1:]
+	}
+
+	switch {
+	case r.Method == http.MethodPost && action == "toggle":
+		enabled, err := scanner.ToggleRule(rulesPath, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": enabled})
+
+	case r.Method == http.MethodDelete && action == "":
+		if err := scanner.DeleteRule(rulesPath, id); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 

@@ -16,12 +16,12 @@ func TestLoadConfig_FileMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing file should not error, got %v", err)
 	}
-	if len(rules) == 0 {
-		t.Fatal("expected built-in rules even when file missing")
+	if len(rules) != 0 {
+		t.Fatalf("missing file should yield zero rules (bootstrap is the caller's job); got %d", len(rules))
 	}
 }
 
-func TestLoadConfig_AppendsUserRules(t *testing.T) {
+func TestLoadConfig_LoadsUserRules(t *testing.T) {
 	yaml := `
 rules:
   - id: mycorp_token
@@ -35,28 +35,23 @@ rules:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	hasUser := false
-	hasBuiltIn := false
-	for _, r := range rules {
-		if r.ID == "mycorp_token" {
-			hasUser = true
-		}
-		if r.ID == "anthropic_key" {
-			hasBuiltIn = true
-		}
-	}
-	if !hasUser {
-		t.Error("user rule not loaded")
-	}
-	if !hasBuiltIn {
-		t.Error("built-in rule missing — user rules should append, not replace")
+	if len(rules) != 1 || rules[0].ID != "mycorp_token" {
+		t.Fatalf("expected exactly one rule 'mycorp_token', got %+v", rules)
 	}
 }
 
-func TestLoadConfig_DisabledRemovesBuiltIn(t *testing.T) {
+func TestLoadConfig_PerRuleEnabledFalseSkipsRule(t *testing.T) {
 	yaml := `
-disabled: [email, jwt]
-rules: []
+rules:
+  - id: keep_me
+    pattern: 'A'
+    severity: high
+    direction: outbound
+  - id: silenced
+    pattern: 'B'
+    severity: high
+    direction: outbound
+    enabled: false
 `
 	path := writeTemp(t, yaml)
 	rules, err := scanner.LoadConfig(path, nil)
@@ -64,9 +59,69 @@ rules: []
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	for _, r := range rules {
-		if r.ID == "email" || r.ID == "jwt" {
-			t.Fatalf("rule %q should have been disabled", r.ID)
+		if r.ID == "silenced" {
+			t.Fatalf("rule with enabled:false should have been skipped")
 		}
+	}
+	if len(rules) != 1 || rules[0].ID != "keep_me" {
+		t.Fatalf("expected only 'keep_me' to load, got %+v", rules)
+	}
+}
+
+func TestToggleRule_FlipsEnabled(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: x
+    pattern: 'A'
+    severity: high
+    direction: outbound
+`)
+	// First toggle: enabled (default) → false.
+	now, err := scanner.ToggleRule(path, "x")
+	if err != nil {
+		t.Fatalf("ToggleRule: %v", err)
+	}
+	if now {
+		t.Error("first toggle should leave rule disabled")
+	}
+	// Loading should now skip 'x'.
+	rules, _ := scanner.LoadConfig(path, nil)
+	if len(rules) != 0 {
+		t.Errorf("disabled rule should not load, got %d", len(rules))
+	}
+	// Second toggle: false → enabled (field removed).
+	now, err = scanner.ToggleRule(path, "x")
+	if err != nil {
+		t.Fatalf("ToggleRule 2: %v", err)
+	}
+	if !now {
+		t.Error("second toggle should re-enable")
+	}
+	rules, _ = scanner.LoadConfig(path, nil)
+	if len(rules) != 1 {
+		t.Errorf("re-enabled rule should load, got %d", len(rules))
+	}
+}
+
+func TestDeleteRule_RemovesFromFile(t *testing.T) {
+	path := writeTemp(t, `rules:
+  - id: keep
+    pattern: 'A'
+    severity: high
+    direction: outbound
+  - id: drop
+    pattern: 'B'
+    severity: high
+    direction: outbound
+`)
+	if err := scanner.DeleteRule(path, "drop"); err != nil {
+		t.Fatalf("DeleteRule: %v", err)
+	}
+	rules, _ := scanner.LoadConfig(path, nil)
+	if len(rules) != 1 || rules[0].ID != "keep" {
+		t.Errorf("expected only 'keep' to remain, got %+v", rules)
+	}
+	if err := scanner.DeleteRule(path, "nonexistent"); err == nil {
+		t.Error("deleting unknown id should error")
 	}
 }
 
