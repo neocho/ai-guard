@@ -16,7 +16,6 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"errors"
 	"io"
 	"log/slog"
@@ -352,15 +351,24 @@ func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, req
 	parse.NormalizeRequest(parsedReq)
 	parse.NormalizeResponse(parsedResp)
 
+	// Only scan when the endpoint is on the allowlist. Captures still
+	// flow to the store regardless — non-allowlisted endpoints just have
+	// empty findings. Keeps the audit log complete without flooding the
+	// UI with noise from telemetry batches.
 	var findings []scanner.Finding
-	if p.opts.Scanner != nil {
-		// Outbound: scan raw request body. Request bodies are non-streaming
-		// JSON so regex on raw bytes works fine.
-		findings = append(findings, p.opts.Scanner.Scan(reqBody, scanner.DirectionOutbound, "req_body")...)
-		// Inbound: scan the reassembled response content per-string. This
-		// is where chunk-spanning matters; scanning raw resp bytes would
-		// miss a "rm -rf /" split across two text_deltas.
-		findings = append(findings, scanInboundFromResponse(p.opts.Scanner, parsedResp)...)
+	if p.opts.Scanner != nil && scanner.IsScannable(host, r.URL.Path) {
+		// Outbound: walk the parsed JSON body, scan every string leaf,
+		// tag with its JSON path (req.messages[0].content, req.system, ...).
+		findings = append(findings, p.opts.Scanner.ScanJSON(reqBody, scanner.DirectionOutbound, "req")...)
+		// Inbound: re-marshal the streaming-reassembled response into JSON,
+		// then walk the same way. Raw SSE bytes can't be regex'd directly —
+		// matches like "rm -rf /" can split across deltas. The parser has
+		// already done the reassembly; we just walk its output.
+		if parsedResp != nil {
+			if respJSON, err := json.Marshal(parsedResp); err == nil {
+				findings = append(findings, p.opts.Scanner.ScanJSON(respJSON, scanner.DirectionInbound, "resp")...)
+			}
+		}
 	}
 
 	for _, f := range findings {
@@ -390,36 +398,6 @@ func (p *Proxy) appendCapture(start time.Time, host string, r *http.Request, req
 		ParsedReq:   encodeJSONString(parsedReq),
 		ParsedResp:  encodeJSONString(parsedResp),
 	})
-}
-
-// scanInboundFromResponse walks the structured response and scans each
-// human-visible string independently. Two sources we care about:
-//
-//   - Text block content (the model's natural-language output)
-//   - Tool-use input fields (the model's structured call args; this is
-//     where "run rm -rf /" would live)
-//
-// We don't scan thinking blocks (encoded signatures, not human content)
-// or block-meta fields (ids, indices).
-func scanInboundFromResponse(s *scanner.Scanner, resp *parse.Response) []scanner.Finding {
-	if s == nil || resp == nil {
-		return nil
-	}
-	var out []scanner.Finding
-	for i, b := range resp.Content {
-		switch {
-		case b.Text != "":
-			src := fmt.Sprintf("resp.content[%d].text", i)
-			out = append(out, s.Scan([]byte(b.Text), scanner.DirectionInbound, src)...)
-		case b.ToolUse != nil:
-			// Scan the whole JSON input value as one string. Catches
-			// `{"command":"rm -rf /"}` style matches without needing to
-			// recursively walk every nested JSON field.
-			src := fmt.Sprintf("resp.content[%d].tool_use[%s].input", i, b.ToolUse.Name)
-			out = append(out, s.Scan(b.ToolUse.Input, scanner.DirectionInbound, src)...)
-		}
-	}
-	return out
 }
 
 // encodeJSONString marshals v to a JSON string. Returns "" if v is nil or
