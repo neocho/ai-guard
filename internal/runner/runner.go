@@ -88,14 +88,35 @@ func runAppBundle(ctx context.Context, appPath string, childArgs []string, extra
 		return -1, fmt.Errorf("inspect %s: %w", cleanPath, err)
 	}
 
-	// Build: open -na <app> --env K=V --env K=V ... [--args arg1 arg2]
+	// Pull our proxy URL out of extraEnv so we can also pass it as a
+	// Chromium CLI flag. Electron apps that override their own proxy
+	// config at runtime (Claude Desktop calls session.setProxy() at
+	// startup) ignore HTTPS_PROXY env vars but still honor the
+	// `--proxy-server` CLI flag — it's read by Chromium before any app
+	// code runs. Cursor / Codex Desktop already honor the env var, so
+	// passing the redundant flag is harmless for them. Non-Electron
+	// `.app` bundles will see an unknown arg and typically ignore it.
+	var proxyURL string
+	for _, e := range extraEnv {
+		if strings.HasPrefix(e, "HTTPS_PROXY=") {
+			proxyURL = strings.TrimPrefix(e, "HTTPS_PROXY=")
+			break
+		}
+	}
+
+	// Build: open -na <app> --env K=V --env K=V ... [--args --proxy-server=URL child-args...]
 	openArgs := []string{"-na", cleanPath}
 	for _, e := range extraEnv {
 		openArgs = append(openArgs, "--env", e)
 	}
-	if len(childArgs) > 0 {
+	var appArgs []string
+	if proxyURL != "" {
+		appArgs = append(appArgs, "--proxy-server="+proxyURL)
+	}
+	appArgs = append(appArgs, childArgs...)
+	if len(appArgs) > 0 {
 		openArgs = append(openArgs, "--args")
-		openArgs = append(openArgs, childArgs...)
+		openArgs = append(openArgs, appArgs...)
 	}
 
 	openCmd := exec.CommandContext(ctx, "open", openArgs...)
