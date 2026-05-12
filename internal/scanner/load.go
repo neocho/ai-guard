@@ -271,4 +271,16 @@ const StarterConfig = `rules:
     severity: low
     direction: outbound
     action: allow
+  - id: rm_rf_root
+    description: rm -rf targeting / or ~
+    pattern: '\brm\s+-rf?\s+(?:/|~)(\s|$)'
+    severity: high
+    direction: inbound
+    action: warn
+  - id: sql_drop
+    description: Destructive SQL DROP statement
+    pattern: '(?i)\bDROP\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|TRIGGER|PROCEDURE|FUNCTION)\b'
+    severity: high
+    direction: inbound
+    action: warn
 `
