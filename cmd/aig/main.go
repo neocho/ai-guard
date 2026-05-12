@@ -5,6 +5,14 @@ import (
 	"os"
 )
 
+// Version + Commit are populated by `go build -ldflags "-X main.Version=...
+// -X main.Commit=..."` in scripts/release.sh. Default values are used in
+// dev builds (plain `go build` / `go run`).
+var (
+	Version = "dev"
+	Commit  = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		usage(os.Stderr)
@@ -23,6 +31,9 @@ func main() {
 		os.Exit(cmdCertStatus(os.Args[2:]))
 	case "rules":
 		os.Exit(cmdRules(os.Args[2:]))
+	case "-v", "--version", "version":
+		fmt.Printf("aig %s (%s)\n", Version, Commit)
+		os.Exit(0)
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		os.Exit(0)
@@ -43,7 +54,9 @@ commands:
   uninstall-cert         remove aig's CA from the login keychain
   cert-status            show CA file + keychain install + trust status
   rules <subcommand>     manage scanner rules (e.g. "aig rules list")
+  version                show build version + commit
 
 flags:
-  -h, --help             show this help`)
+  -h, --help             show this help
+  -v, --version          show build version`)
 }

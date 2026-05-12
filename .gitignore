@@ -4,6 +4,7 @@ plan/
 
 # Go build output
 bin/
+dist/
 *.test
 *.out
 vendor/
