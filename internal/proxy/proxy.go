@@ -296,10 +296,35 @@ func (p *Proxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request, connec
 	// Outbound scan. Only fires on allowlisted endpoints — telemetry,
 	// oauth, mcp-registry, etc. flow through unscanned to keep the audit
 	// log complete without flooding the UI with noise.
+	//
+	// Scan ONLY the latest user-role message — that's the new content
+	// being sent this turn. Earlier messages (system prompt, prior user
+	// turns, prior assistant turns) are history the agent already has;
+	// re-scanning them on every turn creates O(turns²) noise and would
+	// flag content that was already evaluated when it first appeared.
 	var findings []scanner.Finding
 	scannable := p.opts.Scanner != nil && p.isScannable(connectHost, r.URL.Path)
 	if scannable {
-		findings = p.opts.Scanner.ScanJSON(reqBody, scanner.DirectionOutbound, "req")
+		scanned := false
+		if parsedReq != nil {
+			for i := len(parsedReq.Messages) - 1; i >= 0; i-- {
+				if parsedReq.Messages[i].Role != "user" {
+					continue
+				}
+				if msgJSON, err := json.Marshal(parsedReq.Messages[i]); err == nil {
+					src := fmt.Sprintf("req.messages[%d]", i)
+					findings = append(findings, p.opts.Scanner.ScanJSON(msgJSON, scanner.DirectionOutbound, src)...)
+					scanned = true
+				}
+				break
+			}
+		}
+		if !scanned {
+			// Fallback: parser didn't yield a user message (unrecognized
+			// endpoint schema or empty messages). Scan the raw body so
+			// new providers we don't have parsers for still get coverage.
+			findings = append(findings, p.opts.Scanner.ScanJSON(reqBody, scanner.DirectionOutbound, "req")...)
+		}
 	}
 
 	// Policy: if any finding has Action=block, refuse to forward.
