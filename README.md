@@ -27,8 +27,17 @@ aig run /Applications/Cursor.app
 ```
 
 Captures land in `~/.aig/captures.db`. Run `aig serve` to expose a local
-JSON API, or install the [AIGuard Mac app](https://github.com/neocho/ai-guard-mac/releases)
-for the UI.
+JSON API, or install the Mac app below for the UI.
+
+## Mac app (optional)
+
+Visual capture browser, rule editor, macOS notifications on high-severity
+findings, and a menu-bar launcher for wrapping Cursor / Claude / Codex Desktop.
+
+[Download AIGuard.dmg →](https://github.com/neocho/ai-guard/releases/download/v0.1.1/AIGuard-v0.1.0.dmg)
+
+Signed by Internet Friends, Inc. and notarized by Apple — open the dmg,
+drag to Applications, launch.
 
 ## Supported agents
 
